@@ -4,8 +4,8 @@ import mediapy
 from scipy.io import savemat
 import argparse
 from tqdm import tqdm
-from new_queries import add_new_tracks
-from tracking_viz import generate_frame_image_cv
+from math.new_queries import add_new_tracks
+from aux.tracking_viz import generate_frame_image_cv
 
 # add tapnext to pythonpath
 import sys
