@@ -1,7 +1,7 @@
 import time
 import torch
 
-def add_new_tracks(tracks_step, query_pts, px_thereshold=15 ):
+def add_new_tracks(tracks_step, query_pts, px_thereshold=5):
   """
     Add new tracks to parts of the query points that are not being covered
     by the current tracks.

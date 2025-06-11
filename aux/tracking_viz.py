@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import os
 
 def generate_frame_image_cv(video, output_tensor):
     """
@@ -47,5 +48,8 @@ def generate_frame_image_cv(video, output_tensor):
                 pt = tuple(map(int, history_window[-1]))
                 cv2.circle(img, pt, radius=2, color=(255, 255, 255), thickness=-1)
 
-        output_path = f'/home/manuelf/mast3r/test_images/tracks_frame_{frame:03d}.png'
+        output_dir = './test_images'
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        output_path = f'{output_dir}/tracks_frame_{frame:03d}.png'
         cv2.imwrite(output_path, img)

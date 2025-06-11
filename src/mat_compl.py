@@ -1,13 +1,13 @@
-import numpy as np
+import torch
 from tqdm import tqdm
-
-def alternating_matrix_completion(M_obs, rank=5, max_iters=100, tol=1e-4, verbose=False):
+import numpy as np
+def alternating_matrix_completion(M_obs, rank=5, max_iters=100, tol=1e-4, verbose=False, device='cpu'):
     """
-    Alternating Least Squares for low-rank matrix completion.
-    
+    Alternating Least Squares for low-rank matrix completion using PyTorch.
+
     Parameters:
-        M_obs: np.ndarray
-            Partially observed matrix with np.nan for missing values.
+        M_obs: torch.Tensor
+            Partially observed matrix with NaNs for missing values.
         rank: int
             Desired rank of the completed matrix.
         max_iters: int
@@ -16,52 +16,59 @@ def alternating_matrix_completion(M_obs, rank=5, max_iters=100, tol=1e-4, verbos
             Convergence tolerance based on Frobenius norm.
         verbose: bool
             Whether to print progress.
-    
+        device: str
+            Device to use ('cpu' or 'cuda').
+
     Returns:
-        M_completed: np.ndarray
+        M_completed: torch.Tensor
             The completed matrix.
+        error_list: torch.Tensor
+            List of RMSE errors per iteration.
     """
+
+    if type(M_obs) is np.ndarray:
+        M_obs = torch.tensor(M_obs, dtype=torch.float32)
+        
+    M_obs = M_obs.to(device)
     m, n = M_obs.shape
-    mask = ~np.isnan(M_obs)
+    mask = ~torch.isnan(M_obs)
 
     # Random initialization
-    U = np.random.randn(m, rank)
-    V = np.random.randn(n, rank)
+    U = torch.randn(m, rank, device=device)
+    V = torch.randn(n, rank, device=device)
 
-    #save error over iterations
     error_list = []
 
     for iteration in tqdm(range(max_iters)):
         # Fix V, solve for U
         for i in range(m):
-            
-            idx = mask[i, :]
-            if np.any(idx): # if there is at least one observed entry
-                V_sub = V[idx, :]
-                M_sub = M_obs[i, idx]
-                U[i, :] = np.linalg.lstsq(V_sub, M_sub, rcond=None)[0]
+            idx = mask[i]
+            if idx.any():
+                V_sub = V[idx]  # shape: (num_observed, rank)
+                M_sub = M_obs[i, idx]  # shape: (num_observed,)
+                sol = torch.linalg.lstsq(V_sub, M_sub.unsqueeze(1)).solution
+                U[i] = sol[:rank].squeeze()
 
         # Fix U, solve for V
         for j in range(n):
             idx = mask[:, j]
-            if np.any(idx):
-                U_sub = U[idx, :]
+            if idx.any():
+                U_sub = U[idx]
                 M_sub = M_obs[idx, j]
-                V[j, :] = np.linalg.lstsq(U_sub, M_sub, rcond=None)[0]
+                sol = torch.linalg.lstsq(U_sub, M_sub.unsqueeze(1)).solution
+                V[j] = sol[:rank].squeeze()
 
-        # Compute reconstruction error on observed entries
+        # Compute RMSE on observed entries
         M_hat = U @ V.T
-        error = np.linalg.norm((M_hat - M_obs)[mask]) / np.sqrt(np.sum(mask))
-        error_list.append(error)
+        diff = (M_hat - M_obs)[mask]
+        error = torch.norm(diff) / torch.sqrt(mask.sum())
+        error_list.append(error.item())
 
         if verbose:
-            pass
-            #print(f"Iteration {iteration+1}: RMSE = {error:.6f}")
+            print(f"Iteration {iteration+1}: RMSE = {error.item():.6f}")
         if error < tol:
             break
-
-        # if error remains constant, break
-        if iteration > 0 and abs(error - error_list[-2]) < tol:
+        if iteration > 0 and abs(error.item() - error_list[-2]) < tol:
             break
 
-    return U @ V.T, np.array(error_list)
+    return U @ V.T, torch.tensor(error_list)
