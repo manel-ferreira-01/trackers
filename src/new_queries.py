@@ -14,10 +14,8 @@ def add_new_tracks(tracks_step, query_pts, px_thereshold=5):
       new_tracks: tensor of shape (1, time, M, 2) with the new tracks
   """
 
-  start = time.time()
   # find the points that are not covered by the current tracks
   covered_points = torch.zeros(query_pts.shape[1], dtype=torch.bool, device=query_pts.device)
-  trakcs_to_add = []
 
   for i in range(query_pts.shape[1]):
     # check if the query point is close to the track point
