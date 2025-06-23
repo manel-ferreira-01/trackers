@@ -2,7 +2,7 @@ import torch
 from tqdm import tqdm
 import numpy as np
 
-def alternating_matrix_completion(M_obs, rank=5, max_iters=100, tol=1e-6, verbose=False, device='cpu', mode=0):
+def alternating_matrix_completion(M_obs, rank=4, max_iters=100, tol=1e-6, verbose=False, device='cpu', mode=0):
     """
     Alternating Least Squares for low-rank matrix completion using PyTorch.
 
