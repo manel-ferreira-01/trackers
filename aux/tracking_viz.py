@@ -16,6 +16,8 @@ def generate_frame_image_cv(video, output_tensor):
         output_tensor (torch.Tensor): Output tensor of shape (1, T, N, 2)
     """
 
+    to_video = []
+
     for frame in tqdm(range(video.shape[1])):
         # Convert image to numpy BGR for OpenCV
         img = (((video[0, frame].numpy() + 1) / 2 )*255).astype(np.uint8)
@@ -51,5 +53,11 @@ def generate_frame_image_cv(video, output_tensor):
         output_dir = './test_images'
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+
         output_path = f'{output_dir}/tracks_frame_{frame:03d}.png'
         cv2.imwrite(output_path, img)
+
+        to_video.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+    # Save video
+    mediapy.write_video('tracking_output.mp4', to_video, fps=30)

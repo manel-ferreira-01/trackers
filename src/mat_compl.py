@@ -58,7 +58,6 @@ def alternating_matrix_completion(M_obs, rank=5, max_iters=100, tol=1e-6, verbos
         U = U_svd[:, :rank] * S_svd[:rank].sqrt()
         V = V_svd[:rank, :].T * S_svd[:rank].sqrt()
 
-
     error_list = []
 
     pbar = tqdm(range(max_iters))
@@ -67,7 +66,7 @@ def alternating_matrix_completion(M_obs, rank=5, max_iters=100, tol=1e-6, verbos
         for i in range(m):
             idx = mask[i]
             if idx.any():
-                V_sub = V[idx]  # shape: (num_observed, rank)
+                V_sub = V[idx]  # shape: (num_observed, rank), vai buscar a 1a dimensao
                 M_sub = M_obs[i, idx]  # shape: (num_observed,)
                 sol = torch.linalg.lstsq(V_sub, M_sub.unsqueeze(1)).solution
                 U[i] = sol[:rank].squeeze()
@@ -95,5 +94,5 @@ def alternating_matrix_completion(M_obs, rank=5, max_iters=100, tol=1e-6, verbos
             break
         
         pbar.set_postfix({'RMSE': f'{error.item():.12f}'})
-    #return U, V.T
+        
     return U @ V.T, torch.tensor(error_list)
