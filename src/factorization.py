@@ -81,3 +81,95 @@ def constraint_torch(m1, m2):
         m1[1] * m2[2] + m1[2] * m2[1],
         m1[2] * m2[2]
     ], dtype=m1.dtype, device=m1.device)
+
+def costeira_marques(Wo_np, iterMax1=50, iterMax2=30, stopError1=1e-5, stopError2=1e-2, device='cpu'):
+    """
+    Marques & Costeira factorization method (CV IU 2009) in PyTorch
+
+    Args:
+        Wo_np: np.ndarray or torch.Tensor with shape (2F, P), containing NaNs for missing entries
+    Returns:
+        Motion: (2F, 3) motion matrix
+        Shape: (3, P) 3D shape matrix
+        T: (2F, 1) translation per frame
+    """
+    if isinstance(Wo_np, np.ndarray):
+        Wo = torch.tensor(Wo_np, dtype=torch.float32)
+    else:
+        Wo = Wo_np.clone().float()
+
+    Wo = Wo.to(device)
+    M = ~torch.isnan(Wo)  # mask of observed entries
+    Wo[~M] = 0  # zero-fill missing entries for initialization
+
+    row_means = torch.sum(Wo, dim=1) / torch.sum(M, dim=1)
+    Wo = M * Wo + (~M) * row_means[:, None]  # mean imputation
+    W = Wo.clone()
+
+    F = W.shape[0] // 2 # Number of frames
+    P = W.shape[1]
+
+    ind = torch.where(torch.sum(M, dim=0) == 2 * F)[0]
+    if len(ind) > 0:
+        T = Wo[:, ind[0]].unsqueeze(1)
+    else:
+        T = W.mean(dim=1, keepdim=True)
+
+    # Initial SVD factorization
+    W_centered = W - T
+    U, S, Vh = torch.linalg.svd(W_centered, full_matrices=False)
+    E = torch.diag(S[:3])
+    R = U[:, :3] @ torch.sqrt(E)
+    S = torch.sqrt(E) @ Vh[:3, :]
+
+    iter1 = 0
+    error1 = float('inf')
+    Motionret = Tret = Shaperet = None
+
+    try:
+        while error1 > stopError1 and iter1 < iterMax1:
+            W_centered = W - T
+            Woit = Wo - T
+
+            iterAux = 0
+            error2 = float('inf')
+
+            while error2 > stopError2 and iterAux < iterMax2:
+                Motion = []
+                for i in range(F):
+                    A_f = proj_stiefel(R[2 * i:2 * i + 2, :].T).T
+                    Motion.append(A_f)
+                Motion = torch.cat(Motion, dim=0)
+
+                Shape = torch.linalg.pinv(Motion) @ W_centered
+                R = W_centered @ torch.linalg.pinv(Shape)
+
+                iterAux += 1
+
+            W_hat = Motion @ Shape + T
+            W = Motion @ Shape * (~M) + Woit * M + T
+
+            iter1 += 1
+            prev_error = error1
+            error1 = torch.norm(W - W_hat) / torch.sqrt(torch.tensor(W.numel(), dtype=torch.float32))
+
+            if len(ind) > 0:
+                T = Wo[:, ind[0]].unsqueeze(1)
+            else:
+                T = W.mean(dim=1, keepdim=True)
+                Motionret = Motion
+                Tret = T
+                Shaperet = Shape
+
+    except Exception as e:
+        print("Fallback due to error:", e)
+        Motion = Motionret
+        T = Tret
+        Shape = Shaperet
+
+    return Motion, Shape, T
+
+def proj_stiefel(Wo):
+    U, S, Vh = torch.linalg.svd(Wo, full_matrices=False)
+    c = S.mean()
+    return c * U @ Vh
