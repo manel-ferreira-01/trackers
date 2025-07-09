@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from tqdm import tqdm
 
 def marques_factorization(obs_mat: torch.Tensor):
     """
@@ -82,7 +83,8 @@ def constraint_torch(m1, m2):
         m1[2] * m2[2]
     ], dtype=m1.dtype, device=m1.device)
 
-def costeira_marques(Wo_np, iterMax1=50, iterMax2=30, stopError1=1e-5, stopError2=1e-2, device='cpu'):
+def costeira_marques(Wo_np, iterMax1=50, iterMax2=30, stopError1=1e-5, stopError2=1e-2, device='cpu',
+                     verbose=False):
     """
     Marques & Costeira factorization method (CV IU 2009) in PyTorch
 
@@ -127,45 +129,49 @@ def costeira_marques(Wo_np, iterMax1=50, iterMax2=30, stopError1=1e-5, stopError
     Motionret = Tret = Shaperet = None
 
     try:
-        while error1 > stopError1 and iter1 < iterMax1:
-            W_centered = W - T
-            Woit = Wo - T
+        with tqdm(total=iterMax1, desc='Outer Iterations') as pbar:
+            while error1 > stopError1 and iter1 < iterMax1:
+                W_centered = W - T
+                Woit = Wo - T
 
-            iterAux = 0
-            error2 = float('inf')
+                iterAux = 0
+                error2 = float('inf')
 
-            while error2 > stopError2 and iterAux < iterMax2:
-                Motion = []
-                for i in range(F):
-                    A_f = proj_stiefel(R[2 * i:2 * i + 2, :].T).T
-                    Motion.append(A_f)
-                Motion = torch.cat(Motion, dim=0)
+                while error2 > stopError2 and iterAux < iterMax2:
+                    Motion = []
+                    for i in range(F):
+                        A_f = proj_stiefel(R[2 * i:2 * i + 2, :].T).T
+                        Motion.append(A_f)
+                    Motion = torch.cat(Motion, dim=0)
 
-                Shape = torch.linalg.pinv(Motion) @ W_centered
+                    Shape = torch.linalg.pinv(Motion) @ W_centered
 
-                prev_R = R.clone()
-                R = W_centered @ torch.linalg.pinv(Shape)
+                    prev_R = R.clone()
+                    R = W_centered @ torch.linalg.pinv(Shape)
 
-                error2 = torch.norm(R - prev_R) / torch.norm(prev_R)
-                print(f"Iteration {iterAux}, Error: {error2.item()}")
+                    error2 = torch.norm(R - prev_R) / torch.norm(prev_R)
+                    if verbose:
+                        print(f"Inner Iteration {iterAux}, Error: {error2.item()}")
 
-                iterAux += 1
+                    iterAux += 1
 
-            W_hat = Motion @ Shape + T
-            W = Motion @ Shape * (~M) + Woit * M + T
+                W_hat = Motion @ Shape + T
+                W = Motion @ Shape * (~M) + Woit * M + T
 
-            iter1 += 1
-            prev_error = error1
-            error1 = torch.norm(W - W_hat) / torch.sqrt(torch.tensor(W.numel(), dtype=torch.float32))
-            print(error1)
+                iter1 += 1
+                pbar.update(1)
+                prev_error = error1
+                error1 = torch.norm(W - W_hat) / torch.sqrt(torch.tensor(W.numel(), dtype=torch.float32))
+                if verbose:
+                    print(f"Outer Iteration {iter1}, Error: {error1.item()}")
 
-            if len(ind) > 0:
-                T = Wo[:, ind[0]].unsqueeze(1)
-            else:
-                T = W.mean(dim=1, keepdim=True)
-                Motionret = Motion
-                Tret = T
-                Shaperet = Shape
+                if len(ind) > 0:
+                    T = Wo[:, ind[0]].unsqueeze(1)
+                else:
+                    T = W.mean(dim=1, keepdim=True)
+                    Motionret = Motion
+                    Tret = T
+                    Shaperet = Shape
 
     except Exception as e:
         print("Fallback due to error:", e)
