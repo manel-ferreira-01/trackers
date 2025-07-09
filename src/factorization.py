@@ -142,7 +142,12 @@ def costeira_marques(Wo_np, iterMax1=50, iterMax2=30, stopError1=1e-5, stopError
                 Motion = torch.cat(Motion, dim=0)
 
                 Shape = torch.linalg.pinv(Motion) @ W_centered
+
+                prev_R = R.clone()
                 R = W_centered @ torch.linalg.pinv(Shape)
+
+                error2 = torch.norm(R - prev_R) / torch.norm(prev_R)
+                print(f"Iteration {iterAux}, Error: {error2.item()}")
 
                 iterAux += 1
 
@@ -152,6 +157,7 @@ def costeira_marques(Wo_np, iterMax1=50, iterMax2=30, stopError1=1e-5, stopError
             iter1 += 1
             prev_error = error1
             error1 = torch.norm(W - W_hat) / torch.sqrt(torch.tensor(W.numel(), dtype=torch.float32))
+            print(error1)
 
             if len(ind) > 0:
                 T = Wo[:, ind[0]].unsqueeze(1)
