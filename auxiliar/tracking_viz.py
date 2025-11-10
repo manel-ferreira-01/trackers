@@ -60,4 +60,4 @@ def generate_frame_image_cv(video, output_tensor):
         to_video.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
     # Save video
-    mediapy.write_video('tracking_output.mp4', to_video, fps=15)
+    mediapy.write_video('tracking_output.mp4', to_video, fps=1)
