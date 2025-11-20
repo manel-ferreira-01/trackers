@@ -12,7 +12,7 @@ import sys, torch
 sys.path.append("/home/manuelf/alltracker")
 from nets.alltracker import Net
 
-def init_tapnext(device):
+def init_tapnext(device, model_path):
 
   tapnext = TAPNext(image_size=(256, 256)).to(device)
 
@@ -21,7 +21,7 @@ def init_tapnext(device):
   for p in tapnext.parameters():
     p.requires_grad = False
 
-  tapnext = restore_model_from_jax_checkpoint(tapnext, "/home/manuelf/tapnet/tapnet/tapnext/tapnet/checkpoints/bootstapnext_ckpt.npz")
+  tapnext = restore_model_from_jax_checkpoint(tapnext, model_path)
 
   return tapnext
 
