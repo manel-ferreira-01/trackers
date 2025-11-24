@@ -4,9 +4,14 @@ from tqdm import tqdm
 
 def marques_factorization(obs_mat: torch.Tensor):
     """
-    obs_mat: torch.Tensor of shape (2*num_frame, num_features)
+    Performs Marques Factorization on an interleaved observation matrix.
+    
+    Args:
+        obs_mat: torch.Tensor of shape (2*num_frame, num_features)
+                 Structure is interleaved: [x0, y0, x1, y1, ...]^T
+
     Returns:
-        M: motion matrix (2*num_frames x 3)
+        M: motion matrix (2*num_frames x 3) - Interleaved
         S: shape matrix (3 x num_features)
         tvecs: translation vectors per frame (num_frames x 2)
         alphas: scaling parameters per frame (num_frames,)
@@ -16,20 +21,32 @@ def marques_factorization(obs_mat: torch.Tensor):
         obs_mat = torch.tensor(obs_mat, dtype=torch.float32)
     device = obs_mat.device
     dtype = obs_mat.dtype
+    
+    # 1. Calculate centroids (Translation vectors)
+    # Even rows are Xs, Odd rows are Ys
     Xs = obs_mat[0::2, :]
     Ys = obs_mat[1::2, :]
+    
+    # tvecs shape: (num_frames, 2) -> [[tx0, ty0], [tx1, ty1], ...]
+    tvecs = torch.stack([Xs.mean(dim=1), Ys.mean(dim=1)], dim=1) 
+    
+    # 2. Center observations (Maintain Interleaved Structure)
+    # We clone to avoid modifying the input in place if that matters, 
+    # or we can modify obs_mat directly if memory is tight.
+    obs_mat_centered = obs_mat.clone()
+    
+    # Subtract Tx from even rows
+    obs_mat_centered[0::2, :] = Xs - tvecs[:, 0:1]
+    # Subtract Ty from odd rows
+    obs_mat_centered[1::2, :] = Ys - tvecs[:, 1:2]
 
-    # Center observations
-    tvecs = torch.stack([Xs.mean(dim=1), Ys.mean(dim=1)], dim=1)  # (num_frames, 2)
-    Xs = Xs - Xs.mean(dim=1, keepdim=True)
-    Ys = Ys - Ys.mean(dim=1, keepdim=True)
-    obs_mat_centered = torch.cat([Xs, Ys], dim=0)
-
-    # SVD decomposition
+    # 3. SVD decomposition on Interleaved Matrix
+    # U will be (2F, 2F), we take top 3 components
     U, S, Vh = torch.linalg.svd(obs_mat_centered, full_matrices=True)
     V = Vh.T
 
     S_root = torch.sqrt(S[0:3])
+    # M_hat is now interleaved: [Mx0, My0, Mx1, My1, ...]
     M_hat = U[:, 0:3] * S_root
     S_hat = S_root[:, None] * V[:, 0:3].T
 
@@ -37,25 +54,43 @@ def marques_factorization(obs_mat: torch.Tensor):
     A_rows = []
     b = []
 
+    # 4. Build Constraints (Interleaved Indexing)
     for f in range(num_frames):
-        A_rows.append(constraint_torch(M_hat[f], M_hat[f]))
+        # Row indices for frame f in an interleaved matrix
+        row_x = 2 * f
+        row_y = 2 * f + 1
+        
+        # Constraint: |Mx|^2 = alpha
+        A_rows.append(constraint_torch(M_hat[row_x], M_hat[row_x]))
         b.append(1.0)
-        A_rows.append(constraint_torch(M_hat[num_frames + f], M_hat[num_frames + f]))
+        
+        # Constraint: |My|^2 = alpha
+        A_rows.append(constraint_torch(M_hat[row_y], M_hat[row_y]))
         b.append(1.0)
-        A_rows.append(constraint_torch(M_hat[f], M_hat[num_frames + f]))
+        
+        # Constraint: Mx . My = 0
+        A_rows.append(constraint_torch(M_hat[row_x], M_hat[row_y]))
         b.append(0.0)
 
     A = torch.stack(A_rows, dim=0)  # (3*num_frames, 6)
     b = torch.tensor(b, dtype=dtype, device=device).unsqueeze(1)  # (3*num_frames, 1)
 
-    # Build the alpha constraints
-    mat = torch.kron(torch.eye(num_frames, dtype=dtype, device=device), torch.tensor([[-1.0, -1.0, 0.0]], dtype=dtype, device=device).reshape(3,1))
+    # Build the alpha constraints (Metric constraints)
+    # This structure remains valid: for every frame we have 3 equations, 
+    # and we want the first two (norms) to be equal to alpha.
+    mat = torch.kron(
+        torch.eye(num_frames, dtype=dtype, device=device), 
+        torch.tensor([[-1.0, -1.0, 0.0]], dtype=dtype, device=device).reshape(3,1)
+    )
     A = torch.cat([A, mat], dim=1)
 
     # Solve homogeneous system A x = 0 via SVD
     _, _, Vh_full = torch.linalg.svd(A)
     l = Vh_full[-1]
-    l = l / l[6]  # Normalize by l[6]
+    
+    # Normalize and extract alphas
+    # Check for division by zero in robust implementations, but keeping strictly to logic here
+    l = l / l[6]  
     alphas = l[6:]
 
     # Build Q matrix and compute its Cholesky factor L
@@ -65,12 +100,40 @@ def marques_factorization(obs_mat: torch.Tensor):
         [l[2], l[4], l[5]]
     ], dtype=dtype, device=device)
 
-    L = torch.linalg.cholesky(Q)
+    if torch.trace(Q) < 0:
+        Q = -Q
 
+    # --- FIX START: Robust Cholesky / Square Root ---
+    try:
+        # 1. Try standard Cholesky first (fastest)
+        L = torch.linalg.cholesky(Q)
+    except RuntimeError:
+        # 2. If it fails, force Positive Definiteness via Eigendecomposition
+        eigvals, eigvecs = torch.linalg.eigh(Q)
+        
+        # Clamp negative eigenvalues to a small positive epsilon
+        epsilon = 1e-4
+        eigvals = torch.where(eigvals > epsilon, eigvals, torch.tensor(epsilon, device=device, dtype=dtype))
+        
+        # Reconstruct L: Q = V * S * V.T  =>  L = V * sqrt(S)
+        # Note: We don't need to reconstruct Q, we just need L such that L @ L.T approx Q
+        L = eigvecs @ torch.diag(torch.sqrt(eigvals))
+
+    # Recover Metric Motion and Shape
     M = M_hat @ L
     S = torch.linalg.inv(L) @ S_hat
+    
+    num_features = S.shape[1]
 
-    return M, S, tvecs, alphas
+    # 5. Reconstruct Translation Matrix (Interleaved)
+    # tvecs is (F, 2). view(-1, 1) makes it (2F, 1) -> [tx0, ty0, tx1, ty1...]
+    T_vec = tvecs.view(-1, 1)
+    T_mat = T_vec.repeat(1, num_features)
+
+    # Reconstruct the full observation matrix W (Interleaved)
+    W = (M @ S) + T_mat
+
+    return W, M, S, tvecs, alphas
 
 
 def constraint_torch(m1, m2):
@@ -82,6 +145,7 @@ def constraint_torch(m1, m2):
         m1[1] * m2[2] + m1[2] * m2[1],
         m1[2] * m2[2]
     ], dtype=m1.dtype, device=m1.device)
+
 
 def costeira_marques(Wo_np, iterMax1=50, iterMax2=30, stopError1=1e-5, stopError2=1e-2, device='cpu',
                      verbose=False):
@@ -179,9 +243,193 @@ def costeira_marques(Wo_np, iterMax1=50, iterMax2=30, stopError1=1e-5, stopError
         T = Tret
         Shape = Shaperet
 
-    return Motion, Shape, T
+    return Motion, Shape, T, W
 
 def proj_stiefel(Wo):
     U, S, Vh = torch.linalg.svd(Wo, full_matrices=False)
     c = S.mean()
     return c * U @ Vh
+
+def _norm_uv_per_frame(tracks, K):
+    """
+    Normalize pixel coordinates per frame using either a single K or per-frame Ks.
+
+    Args:
+        tracks : [2F, P]
+        K      : [3,3] or [F,3,3]
+
+    Returns:
+        x, y : [F, P] normalized coordinates
+    """
+    F = tracks.shape[0] // 2
+    u = tracks[0::2, :]  # [F, P]
+    v = tracks[1::2, :]  # [F, P]
+
+    if K.ndim == 2:  # same intrinsics for all frames
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+        x = (u - cx) / fx
+        y = (v - cy) / fy
+    else:
+        # per-frame Ks
+        fx = K[:, 0, 0].unsqueeze(1)  # [F,1]
+        fy = K[:, 1, 1].unsqueeze(1)
+        cx = K[:, 0, 2].unsqueeze(1)
+        cy = K[:, 1, 2].unsqueeze(1)
+        x = (u - cx) / fx
+        y = (v - cy) / fy
+
+    return x, y
+
+def _build_W_ortho(x, y, lam, d, s):
+    """ Build the orthographic measurement matrix W given the parameters.
+    Args:
+        x: normalized x coordinates [F,P]
+        y: normalized y coordinates [F,P]
+        lam: depth scaling factors [F,P]
+        d: scale per frame [F]
+        s: translation per frame [F]
+    Returns:
+        W: measurement matrix [2F,P]
+        z: depth adjusted scaling factors [F,P]
+    """
+    z = d[:,None]*lam + s[:,None]
+    W = torch.empty((2*lam.shape[0], lam.shape[1]), device=lam.device, dtype=lam.dtype)
+    W[0::2] = x * z
+    W[1::2] = y * z
+    return W, z
+
+@torch.no_grad()
+def _update_affine_ortho(x, y, lam, M, eps=1e-6, clamp_pos=True):
+    F, P = lam.shape
+    Mx, My = M[0::2], M[1::2]
+
+    X2Y2 = x**2 + y**2              # [F,P]
+    L = lam
+
+    a11 = (L*L * X2Y2).sum(1) + eps
+    a22 = (X2Y2).sum(1) + eps
+    a12 = (L * X2Y2).sum(1)
+
+    b1 = ((L*x)*Mx + (L*y)*My).sum(1)
+    b2 = (x*Mx + y*My).sum(1)
+
+    det = a11*a22 - a12*a12 + eps
+    d = (a22*b1 - a12*b2) / det
+    s = (-a12*b1 + a11*b2) / det
+    if clamp_pos:
+        d = torch.clamp(d, min=1e-5)
+    return d, s
+
+def _update_affine_ortho_lstsq(x, y, lam, M):
+    """
+    Orthographic per-frame least squares update using the full matrix solver.
+
+    Args:
+        x, y : [F, P] normalized image coordinates
+        lam  : [F, P] raw monocular depths (λ)
+        M    : [2F, P] target low-rank reconstruction (USV^T)
+
+    Returns:
+        d, s : [F] scale and shift per frame
+    """
+    F, P = lam.shape
+    Mx, My = M[0::2], M[1::2]   # split 2×P blocks
+
+    d = torch.empty(F, device=lam.device, dtype=lam.dtype)
+    s = torch.empty(F, device=lam.device, dtype=lam.dtype)
+
+    for f in range(F):
+        # Design matrix A_f : [2P, 2]
+        A_f = torch.stack([
+            torch.cat([x[f] * lam[f], y[f] * lam[f]]),   # column 1
+            torch.cat([x[f], y[f]])                      # column 2
+        ], dim=1).reshape(2*P, 2)
+
+        # Target vector B_f : [2P]
+        B_f = torch.cat([Mx[f], My[f]])
+
+        # Solve least squares (min ||A_f θ - B_f||^2)
+        theta_f, *_ = torch.linalg.lstsq(A_f, B_f)
+        d[f], s[f] = theta_f
+
+    return d, s
+
+
+def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-6):
+    x, y = _norm_uv_per_frame(tracks, K)
+    F, P = lam.shape
+    d = torch.ones(F, device=lam.device, dtype=lam.dtype)
+    s = torch.zeros(F, device=lam.device, dtype=lam.dtype)
+
+    scales = []
+    offsets = []
+
+    scales.append(d.clone())
+    offsets.append(s.clone())
+
+    best = (float('inf'), d.clone(), s.clone(), None)
+    Mprev = None
+    first_iter_W = _build_W_ortho(x, y, lam, d, s)[0]
+    for iter in tqdm(range(iters)):
+        W, _ = _build_W_ortho(x, y, lam, d, s)
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+        M = (U[:, :rank] * S[:rank]) @ Vh[:rank]
+
+        #d, s = _update_affine_ortho(x, y, lam, M, eps=ridge)
+        d, s = _update_affine_ortho_lstsq(x, y, lam, M)
+
+        # normalize d and s to avoid numerical issues
+        #d = d / d.median()
+        #s = s - s.median()
+        #d = torch.ones_like(s)
+
+        scales.append(d.clone())
+        offsets.append(s.clone())
+
+        Wn, _ = _build_W_ortho(x, y, lam, d, s)
+
+        # at each iteration, project the whole matrix into the
+        Wn = marques_factorization(Wn)[0]
+        #Wn = costeira_marques(Wn)[-1]
+
+        
+        #rho = (torch.norm(Wn - M) / (torch.norm(Wn) + 1e-12)).item()
+        rho = (torch.norm(Wn - M)).item()
+        if rho < best[0] - tol:
+            best = (rho, d.clone(), s.clone(), M.clone())
+        else:
+            if iter > 1e3:
+                print(rho)
+                break
+
+        Mprev = M
+
+    _, d, s, M = best
+    W, z = _build_W_ortho(x, y, lam, d, s)
+    scales = torch.stack(scales)
+    offsets = torch.stack(offsets)
+    return scales, offsets, W, M, first_iter_W, z
+
+def random_affine_camera(device=None, dtype=torch.float32):
+    """
+    Returns a random 2x4 affine camera matrix P_f = [M_f | T_f].
+    M_f (2x3 orthographic projection) has orthonormal rows.
+    T_f (2x1 translation vector) is a random 2D vector.
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    # 1. Generate the 2x3 Orthographic Projection (M_f)
+    # Sample a 3x3 Gaussian matrix
+    A = torch.randn(3, 3, device=device, dtype=dtype)
+    Q, R = torch.linalg.qr(A)
+
+    # Fix sign (optional, but good practice for unique decomposition)
+    d = torch.sign(torch.diag(R))
+    d[d == 0] = 1.0
+    Q = Q @ torch.diag(d)
+
+    M_f = Q[:2, :]  # shape = [2, 3]
+    T_f = torch.randn(2, 1, device=device, dtype=dtype) # shape = [2, 1]
+    P_f = torch.cat((M_f, T_f), dim=1) # shape = [2, 4]
+    return P_f
