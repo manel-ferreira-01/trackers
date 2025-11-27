@@ -31,42 +31,56 @@ def sample_depths(depths, tracks):
     return torch.stack(all_depths, dim=0)  # [F, P]
 
 
-def build_depth_weighted_matrix(tracks, depths, fx, fy, cx, cy):
+def build_depth_weighted_matrix(tracks, depths, Ks):
     """
-    Build a 3F x P depth-weighted observation matrix.
+    Build a 3F x P depth-weighted observation matrix with per-frame intrinsics.
 
     Args:
         tracks: torch.Tensor [2F, P]
             Pixel coordinates (u,v) for each feature across frames.
+            Rows 0,2,4... are u; Rows 1,3,5... are v.
         depths: torch.Tensor [F, H, W]
             Depth map for each frame.
-        fx, fy, cx, cy: floats
-            Camera intrinsics (assumed same for all frames).
+        Ks: torch.Tensor [F, 3, 3]
+            Camera intrinsics matrix for each frame.
 
     Returns:
         W_proj: torch.Tensor [3F, P]
             Depth-weighted homogeneous observation matrix.
+        z: torch.Tensor [F, P]
+            Sampled depth values.
     """
     F = depths.shape[0]
     P = tracks.shape[1]
 
-    # interpolator of depth at 
+    # repeat the K if only one is given
+    #if Ks.ndim == 2: 
+    #    Ks = Ks.unsqueeze(0).expand(F, -1, -1)
+    # ----------------------
+    
+    # 1. Sample depths
     z = sample_depths(depths, tracks) 
 
-    u = tracks[0::2, :]  # [F, P]
-    v = tracks[1::2, :]  # [F, P]
+    # 2. Extract u, v coordinates
+    u = tracks[0::2, :]
+    v = tracks[1::2, :]
 
-    # Normalize to camera plane
-    x_norm = (u - cx) / fx  # [F, P]
-    y_norm = (v - cy) / fy  # [F, P]
+    # 3. Extract intrinsics per frame (Ks is now guaranteed to be [F, 3, 3])
+    fx = Ks[:, 0, 0].unsqueeze(1) 
+    fy = Ks[:, 1, 1].unsqueeze(1)
+    cx = Ks[:, 0, 2].unsqueeze(1)
+    cy = Ks[:, 1, 2].unsqueeze(1)
 
-    W_proj = torch.zeros((3 * F, P), dtype=tracks.dtype, device=tracks.device)
+    # ... rest of the function remains the same ...
+    x_norm = (u - cx) / fx 
+    y_norm = (v - cy) / fy 
 
-    # Fill each frame’s block of 3 rows
-    for f in range(F):
-        W_proj[3 * f + 0, :] = x_norm[f] * z[f]
-        W_proj[3 * f + 1, :] = y_norm[f] * z[f]
-        W_proj[3 * f + 2, :] = z[f]
+    row_x = x_norm * z
+    row_y = y_norm * z
+    row_z = z
+
+    W_stacked = torch.stack([row_x, row_y, row_z], dim=1)
+    W_proj = W_stacked.reshape(3 * F, P)
 
     return W_proj, z
 

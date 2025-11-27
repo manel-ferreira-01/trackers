@@ -358,8 +358,8 @@ def _update_affine_ortho_lstsq(x, y, lam, M):
 def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-6):
     x, y = _norm_uv_per_frame(tracks, K)
     F, P = lam.shape
-    d = torch.ones(F, device=lam.device, dtype=lam.dtype)
-    s = torch.zeros(F, device=lam.device, dtype=lam.dtype)
+    d = torch.ones(F, device=lam.device, dtype=lam.dtype) 
+    s = torch.zeros(F, device=lam.device, dtype=lam.dtype) 
 
     scales = []
     offsets = []
@@ -381,6 +381,7 @@ def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-
         # normalize d and s to avoid numerical issues
         #d = d / d.median()
         #s = s - s.median()
+        #d = d.clone() / d[0]
         #d = torch.ones_like(s)
 
         scales.append(d.clone())
@@ -388,11 +389,10 @@ def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-
 
         Wn, _ = _build_W_ortho(x, y, lam, d, s)
 
-        # at each iteration, project the whole matrix into the
+        # at each iteration, project the whole matrix into the motion manifold
         Wn = marques_factorization(Wn)[0]
         #Wn = costeira_marques(Wn)[-1]
 
-        
         #rho = (torch.norm(Wn - M) / (torch.norm(Wn) + 1e-12)).item()
         rho = (torch.norm(Wn - M)).item()
         if rho < best[0] - tol:
