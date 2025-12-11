@@ -267,16 +267,20 @@ def _norm_uv_per_frame(tracks, K):
 
     if K.ndim == 2:  # same intrinsics for all frames
         fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
-        x = (u - cx) / fx
-        y = (v - cy) / fy
+        #x = (u - cx) / fx
+        #y = (v - cy) / fy
+        x = u
+        y = v
     else:
         # per-frame Ks
         fx = K[:, 0, 0].unsqueeze(1)  # [F,1]
         fy = K[:, 1, 1].unsqueeze(1)
         cx = K[:, 0, 2].unsqueeze(1)
         cy = K[:, 1, 2].unsqueeze(1)
-        x = (u - cx) / fx
-        y = (v - cy) / fy
+        #x = (u - cx) / fx
+        #y = (v - cy) / fy
+        x = u
+        y = v
 
     return x, y
 
@@ -355,11 +359,19 @@ def _update_affine_ortho_lstsq(x, y, lam, M):
     return d, s
 
 
-def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-6):
+def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-6,
+                           init_scales=None, init_offsets=None):
     x, y = _norm_uv_per_frame(tracks, K)
     F, P = lam.shape
-    d = torch.ones(F, device=lam.device, dtype=lam.dtype) 
-    s = torch.zeros(F, device=lam.device, dtype=lam.dtype) 
+
+    if init_scales is not None:
+        d = init_scales.clone()
+    else:
+        d = torch.ones(F, device=lam.device, dtype=lam.dtype)  # scale
+    if init_offsets is not None:
+        s = init_offsets.clone()
+    else:
+        s = torch.zeros(F, device=lam.device, dtype=lam.dtype)  #offset
 
     scales = []
     offsets = []
@@ -370,27 +382,29 @@ def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-
     best = (float('inf'), d.clone(), s.clone(), None)
     Mprev = None
     first_iter_W = _build_W_ortho(x, y, lam, d, s)[0]
+
     for iter in tqdm(range(iters)):
+
         W, _ = _build_W_ortho(x, y, lam, d, s)
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
         M = (U[:, :rank] * S[:rank]) @ Vh[:rank]
 
-        #d, s = _update_affine_ortho(x, y, lam, M, eps=ridge)
-        d, s = _update_affine_ortho_lstsq(x, y, lam, M)
+        d, s = _update_affine_ortho(x, y, lam, M, eps=ridge)
+        #d, s = _update_affine_ortho_lstsq(x, y, lam, M)
 
         # normalize d and s to avoid numerical issues
-        #d = d / d.median()
+        #d = d / (d.median()+1e-6)
         #s = s - s.median()
         #d = d.clone() / d[0]
-        #d = torch.ones_like(s)
-
+        #d = torch.ones_like(d)
+        
         scales.append(d.clone())
         offsets.append(s.clone())
 
         Wn, _ = _build_W_ortho(x, y, lam, d, s)
-
+        
         # at each iteration, project the whole matrix into the motion manifold
-        Wn = marques_factorization(Wn)[0]
+        #Wn = marques_factorization(Wn)[0]
         #Wn = costeira_marques(Wn)[-1]
 
         #rho = (torch.norm(Wn - M) / (torch.norm(Wn) + 1e-12)).item()
@@ -398,7 +412,7 @@ def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-
         if rho < best[0] - tol:
             best = (rho, d.clone(), s.clone(), M.clone())
         else:
-            if iter > 1e3:
+            if iter > 4000:
                 print(rho)
                 break
 
@@ -408,7 +422,7 @@ def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-
     W, z = _build_W_ortho(x, y, lam, d, s)
     scales = torch.stack(scales)
     offsets = torch.stack(offsets)
-    return scales, offsets, W, M, first_iter_W, z
+    return scales, offsets, W, first_iter_W, z
 
 def random_affine_camera(device=None, dtype=torch.float32):
     """

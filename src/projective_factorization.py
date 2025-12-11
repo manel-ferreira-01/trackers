@@ -31,7 +31,7 @@ def sample_depths(depths, tracks):
     return torch.stack(all_depths, dim=0)  # [F, P]
 
 
-def build_depth_weighted_matrix(tracks, depths, Ks):
+def build_depth_weighted_matrix(tracks, depths: torch.Tensor, Ks):
     """
     Build a 3F x P depth-weighted observation matrix with per-frame intrinsics.
 
@@ -49,6 +49,8 @@ def build_depth_weighted_matrix(tracks, depths, Ks):
             Depth-weighted homogeneous observation matrix.
         z: torch.Tensor [F, P]
             Sampled depth values.
+        T: torch.Tensor [F, 3, 3]
+            Hartley normalization transforms for each frame.
     """
     F = depths.shape[0]
     P = tracks.shape[1]
@@ -75,254 +77,166 @@ def build_depth_weighted_matrix(tracks, depths, Ks):
     x_norm = (u - cx) / fx 
     y_norm = (v - cy) / fy 
 
-    row_x = x_norm * z
-    row_y = y_norm * z
-    row_z = z
+    rays2d = torch.stack([x_norm, y_norm], dim=1)
+    rays2d = rays2d.reshape(2 * F, P)
 
-    W_stacked = torch.stack([row_x, row_y, row_z], dim=1)
-    W_proj = W_stacked.reshape(3 * F, P)
+    rays2d_norm, T = hartley_normalize_stacked(rays2d)
 
-    return W_proj, z
+    W_proj = rays2d_norm * z.repeat_interleave(2, dim=0)
+
+    return W_proj, z, T, rays2d
 
 
-def normalize_measurement_matrix(W):
+def hartley_normalize_stacked(W):
     """
-    Isotropic normalization for 3F x P projective measurement matrix.
-
+    Applies Hartley's isotropic normalization to a stacked measurement matrix.
+    
     Args:
-        W: torch.Tensor [3F, P]
-            Depth-weighted homogeneous measurement matrix.
-
+        W: Tensor of shape (2*F, P). 
+           Rows 2*f are x-coords, Rows 2*f+1 are y-coords.
+           
     Returns:
-        W_norm: torch.Tensor [3F, P] normalized matrix
-        T_list: list of torch.Tensor [4,4]
-            Normalization transforms per frame (for upgrading back).
+        W_norm: Tensor (2*F, P) centered and scaled.
+        T: Tensor (F, 3, 3) the transformation matrices used (for inversion).
     """
-    F = W.shape[0] // 3
-    P = W.shape[1]
+    TwoF, P = W.shape
+    F = TwoF // 2
+    device = W.device
 
-    W_norm = torch.zeros_like(W)
-    T_list = []
+    # 1. Reshape to (F, 2, P) to separate X and Y easily
+    # This view allows us to calculate means across the P dimension
+    W_view = W.view(F, 2, P)
+    
+    # 2. Compute Centroid per frame
+    # Mean across points (dim 2). Shape: (F, 2, 1)
+    centroid = torch.mean(W_view, dim=2, keepdim=True)
+    
+    # 3. Shift to Origin
+    centered = W_view - centroid
 
-    for f in range(F):
-        block = W[3*f:3*f+3, :]  # [3, P]
+    # 4. Compute Scale
+    # Distance of every point from origin: sqrt(x^2 + y^2)
+    # Shape: (F, P)
+    dist = torch.norm(centered, dim=1) 
+    
+    # Mean distance per frame. Shape: (F, 1)
+    mean_dist = torch.mean(dist, dim=1, keepdim=True)
+    
+    # Scale factor
+    scale = 1.41421356 / mean_dist
+    
+    # 5. Apply Scale
+    # Shape: (F, 2, P)
+    W_norm_view = centered * scale.unsqueeze(2)
+    
+    # 6. Flatten back to (2F, P)
+    W_norm = W_norm_view.reshape(TwoF, P)
 
-        homog = torch.cat([block, torch.ones(1, P, dtype=W.dtype, device=W.device)], dim=0)
+    # 7. Construct Transformation Matrix T (for inversion later)
+    # T = [[s, 0, -s*cx], [0, s, -s*cy], [0, 0, 1]]
+    T = torch.eye(3, device=device).repeat(F, 1, 1)
+    
+    s = scale.squeeze()             # (F,)
+    cx = centroid[:, 0, 0]          # (F,)
+    cy = centroid[:, 1, 0]          # (F,)
 
-        # Dehomogenize
-        X = homog[0, :] / homog[3, :]
-        Y = homog[1, :] / homog[3, :]
-        Z = homog[2, :] / homog[3, :]
+    T[:, 0, 0] = s
+    T[:, 1, 1] = s
+    T[:, 0, 2] = -s * cx
+    T[:, 1, 2] = -s * cy
+    
+    return W_norm, T
 
-        # Centroid
-        mean_x, mean_y, mean_z = X.mean(), Y.mean(), Z.mean()
+import numpy as np
 
-        # Shift
-        Xs = X - mean_x
-        Ys = Y - mean_y
-        Zs = Z - mean_z
+import numpy as np
 
-        mean_dist = torch.mean(torch.sqrt(Xs**2 + Ys**2 + Zs**2))
-
-        s = torch.sqrt(torch.tensor(3.0, dtype=W.dtype, device=W.device)) / mean_dist
-        #print(3)
-
-        T = torch.tensor([
-            [s, 0, 0, -s*mean_x],
-            [0, s, 0, -s*mean_y],
-            [0, 0, s, -s*mean_z],
-            [0, 0, 0, 1]
-        ], dtype=W.dtype, device=W.device)
-
-        homog_norm = T @ homog
-        W_norm[3*f:3*f+3, :] = homog_norm[:3, :]
-
-        T_list.append(T)
-
-    return W_norm, T_list
-
-# metric_upgrade_daq.py
-import torch
-from typing import List, Tuple
-
-def _sym_vectorize_4x4(Q: torch.Tensor) -> torch.Tensor:
+def solve_metric_upgrade_rays(P_hat_stack):
     """
-    Symmetric 4x4 -> 10-vector [q11, q12, q13, q14, q22, q23, q24, q33, q34, q44].
+    Computes H for metric upgrade with a fix for SVD sign ambiguity.
     """
-    return torch.stack([
-        Q[0,0], Q[0,1], Q[0,2], Q[0,3],
-                Q[1,1], Q[1,2], Q[1,3],
-                        Q[2,2], Q[2,3],
-                                Q[3,3]
-    ])
+    m = P_hat_stack.shape[0]
+    A = np.zeros((5 * m, 10))
 
-def _place_sym_from_vec(q: torch.Tensor) -> torch.Tensor:
-    """
-    10-vector back to symmetric 4x4.
-    """
-    Q = torch.zeros((4,4), dtype=q.dtype, device=q.device)
-    Q[0,0] = q[0]
-    Q[0,1] = Q[1,0] = q[1]
-    Q[0,2] = Q[2,0] = q[2]
-    Q[0,3] = Q[3,0] = q[3]
-    Q[1,1] = q[4]
-    Q[1,2] = Q[2,1] = q[5]
-    Q[1,3] = Q[3,1] = q[6]
-    Q[2,2] = q[7]
-    Q[2,3] = Q[3,2] = q[8]
-    Q[3,3] = q[9]
-    return Q
+    # Index mapping for symmetric matrix Q
+    idx_map = {
+        (0,0):0, (0,1):1, (0,2):2, (0,3):3,
+        (1,1):4, (1,2):5, (1,3):6,
+        (2,2):7, (2,3):8,
+        (3,3):9
+    }
 
-def _constraint_row_from_C(C: torch.Tensor, r: int, s: int) -> torch.Tensor:
-    """
-    Build the linear row a^T * vecs(Q) = 0 for the (r,s) entry of C Q C^T.
-    Uses the 10-term symmetric parameterization of Q.
-    """
-    # Entry (r,s) of C Q C^T = sum_{j,k} C[r,j] * Q[j,k] * C[s,k].
-    # For symmetric Q, collect the 10 unique terms with appropriate 2x for off-diagonals.
-    a = torch.zeros(10, dtype=C.dtype, device=C.device)
-    # helper to add contribution for (j,k)
-    def add(j,k, coeff):
-        idx_map = {
-            (0,0): 0,
-            (0,1): 1, (1,0): 1,
-            (0,2): 2, (2,0): 2,
-            (0,3): 3, (3,0): 3,
-            (1,1): 4,
-            (1,2): 5, (2,1): 5,
-            (1,3): 6, (3,1): 6,
-            (2,2): 7,
-            (2,3): 8, (3,2): 8,
-            (3,3): 9,
-        }
-        a[idx_map[(j,k)]] += coeff
+    def get_coeffs(u, v):
+        coeffs = np.zeros(10)
+        for r in range(4):
+            for c in range(r, 4):
+                k = idx_map[(r, c)]
+                if r == c:
+                    coeffs[k] = u[r] * v[r]
+                else:
+                    coeffs[k] = u[r] * v[c] + u[c] * v[r]
+        return coeffs
 
-    # accumulate symmetric terms
-    for j in range(4):
-        for k in range(4):
-            coeff = C[r, j] * C[s, k]
-            if j == k:
-                add(j, k, coeff)               # diagonal once
-            elif j < k:
-                add(j, k, coeff)               # upper
-            else:
-                add(k, j, coeff)               # mirror into upper
-    return a
+    # Build A
+    row_idx = 0
+    for i in range(m):
+        P = P_hat_stack[i]
+        r1, r2, r3 = P[0], P[1], P[2]
+        # R1 is 1x4
 
-def solve_dual_absolute_quadric(P: torch.Tensor, K_list: List[torch.Tensor]) -> torch.Tensor:
-    """
-    Solve for Ω* (4x4 symmetric, rank 3) from constraints:
-        C_i Ω* C_i^T ∝ I, where C_i = K_i^{-1} P_i
-    Inputs:
-      P: (3F, 4) stacked cameras (each block 3x4)
-      K_list: list of F intrinsics (3x3)
-    Returns:
-      Omega_star: (4x4) dual absolute quadric, scaled so that its three non-zero eigenvalues are positive.
-    """
-    F = len(K_list)
-    assert P.shape[0] == 3*F and P.shape[1] == 4
-    device = P.device
-    rows = []
+        # 1. Orthogonality
+        A[row_idx] =    (r1, r2); row_idx += 1
+        A[row_idx] = get_coeffs(r1, r3); row_idx += 1
+        A[row_idx] = get_coeffs(r2, r3); row_idx += 1
+        # 2. Aspect Ratio
+        A[row_idx] = get_coeffs(r1, r1) - get_coeffs(r2, r2); row_idx += 1
+        A[row_idx] = get_coeffs(r2, r2) - get_coeffs(r3, r3); row_idx += 1
 
-    for f in range(F):
-        Pf = P[3*f:3*f+3, :]                       # 3x4
-        Kinv = torch.linalg.inv(K_list[f]).to(device)
-        C = Kinv @ Pf                               # 3x4
+    # Solve Ax=0
+    _, _, Vt = np.linalg.svd(A)
+    x = Vt[-1]
 
-        # W' = C Ω* C^T should be proportional to I:
-        # Off-diagonals = 0  -> (0,1),(0,2),(1,2)
-        rows.append(_constraint_row_from_C(C, 0, 1))
-        rows.append(_constraint_row_from_C(C, 0, 2))
-        rows.append(_constraint_row_from_C(C, 1, 2))
-        # Equal diagonals -> W11 - W22 = 0, W11 - W33 = 0
-        a11 = _constraint_row_from_C(C, 0, 0)
-        a22 = _constraint_row_from_C(C, 1, 1)
-        a33 = _constraint_row_from_C(C, 2, 2)
-        rows.append(a11 - a22)
-        rows.append(a11 - a33)
+    # --- Reconstruction of Q ---
+    def make_Q(x_vec):
+        Q_mat = np.zeros((4, 4))
+        Q_mat[0,0], Q_mat[1,1], Q_mat[2,2], Q_mat[3,3] = x_vec[0], x_vec[4], x_vec[7], x_vec[9]
+        Q_mat[0,1] = Q_mat[1,0] = x_vec[1]
+        Q_mat[0,2] = Q_mat[2,0] = x_vec[2]
+        Q_mat[0,3] = Q_mat[3,0] = x_vec[3]
+        Q_mat[1,2] = Q_mat[2,1] = x_vec[5]
+        Q_mat[1,3] = Q_mat[3,1] = x_vec[6]
+        Q_mat[2,3] = Q_mat[3,2] = x_vec[8]
+        return Q_mat
 
-    A = torch.stack(rows, dim=0)                   # [(5F) x 10]
+    Q = make_Q(x)
 
-    # Solve A q = 0 (in least-squares sense): smallest singular vector
-    _, _, Vh = torch.linalg.svd(A, full_matrices=False)
-    q = Vh[-1, :]                                  # 10-vector
-    Omega_star = _place_sym_from_vec(q)
+    # --- FIX START: Detect Sign Flip ---
+    # Q must be Positive Semi-Definite. Check the eigenvalues.
+    evals_raw, _ = np.linalg.eigh(Q)
+    
+    # If the largest magnitude eigenvalue is negative, the whole matrix is flipped.
+    # We check the one with largest absolute value to decide the dominant sign.
+    if evals_raw[np.argmax(np.abs(evals_raw))] < 0:
+        x = -x
+        Q = make_Q(x)
+    # --- FIX END ---
 
-    # Project to rank-3 PSD with signature (+,+,+,0)
-    evals, U = torch.linalg.eigh(Omega_star)
-    # Sort ascending; last should be ~0, adjust numerically
-    idx = torch.argsort(evals)
+    # Decompose Q (Symmetric)
+    evals, evecs = np.linalg.eigh(Q)
+    
+    # Sort descending
+    idx = np.argsort(evals)[::-1]
     evals = evals[idx]
-    U = U[:, idx]
+    evecs = evecs[:, idx]
 
-    # Clamp negatives (numerical) on the top 3 to be positive, force the last to 0
-    e = evals.clone()
-    e[:-1] = torch.clamp(e[:-1], min=1e-12)
-    e[-1] = 0.0
-    Omega_star_psd = (U @ torch.diag(e) @ U.T)
+    # Truncate to Rank 3
+    # Note: If data is noisy, 4th eigenvalue might be slightly negative, 
+    # so we clip to 0. But top 3 MUST be positive now.
+    S_sqrt = np.diag(np.sqrt(np.maximum(evals[:3], 1e-10)))
+    H3 = evecs[:, :3] @ S_sqrt
 
-    # Normalize (optional): scale so that mean of non-zero eigs is 1
-    nz = e[:-1].mean().clamp(min=1e-12)
-    Omega_star_psd = Omega_star_psd / nz
-
-    return Omega_star_psd
-
-def factor_upgrade_from_OmegaStar(Omega_star: torch.Tensor) -> torch.Tensor:
-    """
-    Find H such that Omega_star = H * diag(1,1,1,0) * H^T.
-    Returns H (4x4).
-    """
-    evals, U = torch.linalg.eigh(Omega_star)
-    idx = torch.argsort(evals)
-    evals = evals[idx]
-    U = U[:, idx]
-    # Build sqrt of eigenvalues for first three components
-    s = torch.sqrt(torch.clamp(evals[:-1], min=1e-12))
-    H = U @ torch.diag(torch.cat([s, torch.tensor([1.0], dtype=Omega_star.dtype, device=Omega_star.device)]))
+    # 4th vector (Null space) for h
+    h = evecs[:, 3:4]
+    
+    H = np.hstack([H3, h])
     return H
-
-def _project_to_SO3(M: torch.Tensor) -> torch.Tensor:
-    """
-    Nearest rotation to a 3x3 matrix via SVD (polar decomposition).
-    """
-    U, S, Vt = torch.linalg.svd(M)
-    R = U @ Vt
-    if torch.linalg.det(R) < 0:
-        U[:, -1] *= -1
-        R = U @ Vt
-    return R, S.mean()
-
-def metric_upgrade_daq(
-    P: torch.Tensor,              # (3F,4) stacked projective cameras
-    K_list: List[torch.Tensor],   # list of F intrinsics (3,3)
-) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
-    """
-    Compute Euclidean upgrade H from projective cameras P, then return:
-      H: (4,4)  such that P_e = P @ H^{-1} are Euclidean-form cameras
-      P_e: (3F,4) upgraded cameras
-      R_list: list of F rotations (3,3)
-      t_list: list of F translations (3,)
-    """
-    device = P.device
-    Omega_star = solve_dual_absolute_quadric(P, K_list)
-    H = factor_upgrade_from_OmegaStar(Omega_star)
-    Hinv = torch.linalg.inv(H)
-
-    F = len(K_list)
-    P_e = P @ Hinv                                     # upgraded cameras
-    R_list, t_list = [], []
-
-    for f in range(F):
-        Pf = P_e[3*f:3*f+3, :]                         # 3x4
-        K = K_list[f].to(device)
-        Kinv = torch.linalg.inv(K)
-        A = Kinv @ Pf                                  # should be [R | t]
-        R_approx = A[:, :3]
-        R, scale = _project_to_SO3(R_approx)                  # nearest rotation
-        t = A[:, 3] / scale
-        # Reassign translation consistent with projected R
-        # (optional) refine t via least squares: K[R|t] ~ Pf
-        t_list.append(t)
-        R_list.append(R)
-
-    return H, P_e, R_list, t_list
