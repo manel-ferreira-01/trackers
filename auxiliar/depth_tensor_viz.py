@@ -2,18 +2,51 @@ import math
 import matplotlib.pyplot as plt
 import numpy as np
 import k3d
+import torch
 
-def k3d_3d_plot(points, scale=70):
-
+def k3d_3d_plot(point_input, scale=70):
     plot = k3d.plot()
-    # Factorize the "before" matrix
-    mins_before = points.min()
-    maxs_before = points.max()
-    extent_before = (maxs_before - mins_before)  # overall scale of scene
-    point_size_before = float(extent_before / scale)
+    
+    colors = [
+        0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 
+        0x00ffff, 0xff00ff, 0xffa500, 0x800080
+    ]
 
-    points_before = k3d.points(points.T, point_size=point_size_before, color=0xff0000)
-    plot += points_before
+    # --- Handling Input Types ---
+    # 1. If it's not a list or tuple, wrap it so we can iterate over it consistently.
+    if not isinstance(point_input, (list, tuple)):
+        point_list = [point_input]
+    else:
+        point_list = point_input
+
+    for i, points in enumerate(point_list):
+        # 2. Handle PyTorch Tensors -> Convert to NumPy
+        if torch is not None and isinstance(points, torch.Tensor):
+            points = points.detach().cpu().numpy()
+        
+        # Ensure it is treated as a numpy array (handles plain lists too)
+        points = np.asanyarray(points)
+
+        # 3. Standard Logic
+        color = colors[i % len(colors)]
+        
+        mins = points.min()
+        maxs = points.max()
+        extent = (maxs - mins)
+        
+        # Avoid division by zero if extent is 0
+        point_size = float(extent / scale) if extent != 0 else 1.0
+
+        # Assuming input is (3, N) -> Transpose to (N, 3) for K3D
+        points_obj = k3d.points(
+            positions=points.T, 
+            point_size=point_size, 
+            color=color,
+            name=f"Plot {i+1}"
+        )
+        
+        plot += points_obj
+
     plot.display()
 
 

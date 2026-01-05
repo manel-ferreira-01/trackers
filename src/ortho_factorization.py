@@ -358,6 +358,49 @@ def _update_affine_ortho_lstsq(x, y, lam, M):
 
     return d, s
 
+def _update_affine_ortho_shift_only(x, y, lam, M):
+    """
+    Orthographic per-frame least squares update (Shift 's' only, d=1).
+
+    Solves: s * [x, y] = M - lam * [x, y]
+    
+    Args:
+        x, y : [F, P] normalized image coordinates
+        lam  : [F, P] raw monocular depths (λ)
+        M    : [2F, P] target low-rank reconstruction
+
+    Returns:
+        d : [F] Fixed to 1s
+        s : [F] shift per frame
+    """
+    F, P = lam.shape
+    Mx, My = M[0::2], M[1::2]   # split 2×P blocks
+
+    # d is fixed to 1
+    d = torch.ones(F, device=lam.device, dtype=lam.dtype)
+    s = torch.empty(F, device=lam.device, dtype=lam.dtype)
+
+    for f in range(F):
+        # 1. Construct the regressor for s (This corresponds to column 2 of the old A_f)
+        # Vector A: [2P] -> The image coordinates
+        u_vec = torch.cat([x[f], y[f]]) 
+
+        # 2. Construct the target residual (Target - Known Depth Component)
+        # Vector B': [2P] -> (Target M) - (Raw Depth * Coords)
+        target_vec = torch.cat([Mx[f], My[f]])
+        known_depth_vec = torch.cat([x[f] * lam[f], y[f] * lam[f]])
+        
+        rhs = target_vec - known_depth_vec
+
+        # 3. Solve for s using closed form: s = (A . B') / (A . A)
+        numerator = torch.dot(u_vec, rhs)
+        denominator = torch.dot(u_vec, u_vec)
+        
+        # Add a small epsilon to denominator to prevent division by zero if coords are all 0
+        s[f] = numerator / (denominator + 1e-8)
+
+    return d, s
+
 
 def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-6,
                            init_scales=None, init_offsets=None):
@@ -388,16 +431,16 @@ def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-
         W, _ = _build_W_ortho(x, y, lam, d, s)
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
         M = (U[:, :rank] * S[:rank]) @ Vh[:rank]
+        #M = marques_factorization(M)[0]
 
-        d, s = _update_affine_ortho(x, y, lam, M, eps=ridge)
+        #d, s = _update_affine_ortho(x, y, lam, M, eps=ridge)
         #d, s = _update_affine_ortho_lstsq(x, y, lam, M)
+        _, s = _update_affine_ortho_shift_only(x,y,lam,M)
 
-        # normalize d and s to avoid numerical issues
-        #d = d / (d.median()+1e-6)
-        #s = s - s.median()
-        #d = d.clone() / d[0]
-        #d = torch.ones_like(d)
-        
+        # normalize d and s to avoid numerical issues, 
+        #d = d / torch.norm(d)
+        d = torch.ones_like(d)
+
         scales.append(d.clone())
         offsets.append(s.clone())
 
