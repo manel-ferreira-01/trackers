@@ -240,3 +240,102 @@ def solve_metric_upgrade_rays(P_hat_stack):
     
     H = np.hstack([H3, h])
     return H
+
+
+def projective_factorization(obs_mat_scaled):
+    """
+    Performs Projective Factorization on a scaled observation matrix (W * Lambda).
+    
+    Args:
+        obs_mat_scaled: (3*num_frames, num_points) - [u*L, v*L, L]^T structure.
+        
+    Returns:
+        M: Metric motion matrix (3F x 3)
+        S: Metric shape matrix (3 x P)
+        T: Translation component (3F x 1)
+    """
+    device = obs_mat_scaled.device
+    dtype = obs_mat_scaled.dtype
+    num_frames = obs_mat_scaled.shape[0] // 3
+
+    # 1. Centering (Recovery of Translation)
+    # The translation is the mean of each row (if shape is zero-centered)
+    T_vec = obs_mat_scaled.mean(dim=1, keepdim=True) # (3F, 1)
+    W_centered = obs_mat_scaled - T_vec
+
+    # 2. SVD to find rank-3 subspace
+    U, S_vals, Vh = torch.linalg.svd(W_centered, full_matrices=False)
+    
+    S_root = torch.sqrt(S_vals[0:3])
+    M_hat = U[:, 0:3] * S_root       # (3F, 3)
+    S_hat = S_root[:, None] * Vh[0:3, :] # (3, P)
+
+    # 3. Metric Constraints (Enforcing Orthogonality)
+    # For each frame, the 3x3 block must be a rotation matrix (M_hat @ Q @ M_hat.T = I)
+    A_rows = []
+    b_rows = []
+    def constraint_torch(m1, m2):
+        """
+        Helper to create the 6-parameter vector for the symmetric matrix Q.
+        m1.T @ Q @ m2 = b
+        """
+        return torch.tensor([
+            m1[0]*m2[0], m1[0]*m2[1] + m1[1]*m2[0], m1[0]*m2[2] + m1[2]*m2[0],
+            m1[1]*m2[1], m1[1]*m2[2] + m1[2]*m2[1],
+            m1[2]*m2[2]
+        ], device=m1.device, dtype=m1.dtype)
+
+
+    for f in range(num_frames):
+        # Rows for X, Y, and Z (Depth/Scale row)
+        ix, iy, iz = 3*f, 3*f+1, 3*f+2
+        mx, my, mz = M_hat[ix], M_hat[iy], M_hat[iz]
+
+        # Unit Norm constraints: |mx|^2=1, |my|^2=1, |mz|^2=1
+        A_rows.append(constraint_torch(mx, mx)); b_rows.append(1.0)
+        A_rows.append(constraint_torch(my, my)); b_rows.append(1.0)
+        A_rows.append(constraint_torch(mz, mz)); b_rows.append(1.0)
+
+        # Orthogonality constraints: mx.my=0, mx.mz=0, my.mz=0
+        A_rows.append(constraint_torch(mx, my)); b_rows.append(0.0)
+        A_rows.append(constraint_torch(mx, mz)); b_rows.append(0.0)
+        A_rows.append(constraint_torch(my, mz)); b_rows.append(0.0)
+
+    A = torch.stack(A_rows)
+    b = torch.tensor(b_rows, device=device, dtype=dtype).unsqueeze(1)
+
+    # Solve for Q (Linear Least Squares: A @ q = b)
+    # q is the 6 parameters of the symmetric matrix Q = L @ L.T
+    q = torch.linalg.lstsq(A, b).solution.flatten()
+
+    Q = torch.tensor([
+        [q[0], q[1], q[2]],
+        [q[1], q[3], q[4]],
+        [q[2], q[4], q[5]]
+    ], device=device, dtype=dtype)
+
+    # 4. Extract Transformation L
+    # Ensure Q is positive definite (Numerical stability)
+    eigvals, eigvecs = torch.linalg.eigh(Q)
+    eigvals = torch.clamp(eigvals, min=1e-6)
+    L = eigvecs @ torch.diag(torch.sqrt(eigvals))
+
+    # 5. Final Metric Reconstruction
+    M = M_hat @ L
+    S = torch.linalg.inv(L) @ S_hat
+
+    R_1 = M[0:3, :3]
+    det = torch.linalg.det(R_1)
+
+    if det < 0:
+        # We are in a left-handed (mirrored) system.
+        # Flip exactly ONE column of L. This changes the handedness 
+        # of the transformation without breaking the orthogonality.
+        L[:, 0] *= -1
+        
+        # Re-calculate M and S with the corrected L
+        M = M_hat @ L
+        S = torch.linalg.inv(L) @ S_hat
+
+    return M, S, T_vec
+

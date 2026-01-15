@@ -4,48 +4,141 @@ import numpy as np
 import k3d
 import torch
 
-def k3d_3d_plot(point_input, scale=70):
-    plot = k3d.plot()
+import numpy as np
+import torch
+import k3d
+
+def get_orthogonal_camera_vectors(P):
+    """
+    Decomposes P = K[R|t] to find the true orthogonal rotation R.
+    """
+    if torch.is_tensor(P):
+        P = P.detach().cpu().numpy()
     
+    # 1. Handle 2x4 (Affine) vs 3x4 (Projective)
+    if P.shape[0] == 2:
+        M = np.vstack([P[:, :3], [0, 0, 0]]) # Pad to 3x3
+        t = np.vstack([P[:, 3:], [1]])      # Pad to 3x1
+    else:
+        M = P[:3, :3]
+        t = P[:3, 3:]
+
+    # 2. Extract Camera Center
+    try:
+        C = (-np.linalg.inv(M) @ t).flatten()
+    except np.linalg.LinAlgError:
+        C = np.array([0,0,0])
+
+    # 3. RQ Decomposition to isolate pure Rotation (R) from Intrinsics (K)
+    # Using the flip-QR-flip trick
+    M_flipped = np.flipud(M).T
+    Q_q, R_r = np.linalg.qr(M_flipped)
+    
+    R_ortho = np.flipud(Q_q.T)
+    
+    # Ensure a right-handed system (det == 1)
+    if np.linalg.det(R_ortho) < 0:
+        R_ortho[:,0] *= -1
+
+    # 4. Extract Orthogonal Axes
+    # Row 0 = Right, Row 1 = Up (inverted for screen space), Row 2 = Forward
+    right = R_ortho[0, :]
+    up = -R_ortho[1, :] 
+    forward = R_ortho[2, :]
+    
+    return C, right, up, forward
+
+def k3d_3d_plot(point_input, camera_input=None, scale=70):
+    plot = k3d.plot(camera_auto_fit=True)
+    
+    # High-visibility color palette
     colors = [
         0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 
         0x00ffff, 0xff00ff, 0xffa500, 0x800080
     ]
-
-    # --- Handling Input Types ---
-    # 1. If it's not a list or tuple, wrap it so we can iterate over it consistently.
-    if not isinstance(point_input, (list, tuple)):
-        point_list = [point_input]
-    else:
-        point_list = point_input
-
-    for i, points in enumerate(point_list):
-        # 2. Handle PyTorch Tensors -> Convert to NumPy
-        if torch is not None and isinstance(points, torch.Tensor):
-            points = points.detach().cpu().numpy()
+    
+    # --- 1. Process and Plot Points ---
+    global_extent = 1.0
+    if point_input is not None:
+        if not isinstance(point_input, (list, tuple)):
+            point_input = [point_input]
         
-        # Ensure it is treated as a numpy array (handles plain lists too)
-        points = np.asanyarray(points)
+        pts_list = []
+        for p in point_input:
+            if torch.is_tensor(p): p = p.detach().cpu().numpy()
+            p = p.T if p.shape[0] == 3 else p
+            pts_list.append(p)
+            
+        # Determine scene scale for sizing everything else
+        combined = np.vstack(pts_list)
+        mins, maxs = combined.min(axis=0), combined.max(axis=0)
+        global_extent = np.linalg.norm(maxs - mins)
+        if global_extent == 0: global_extent = 1.0
 
-        # 3. Standard Logic
-        color = colors[i % len(colors)]
-        
-        mins = points.min()
-        maxs = points.max()
-        extent = (maxs - mins)
-        
-        # Avoid division by zero if extent is 0
-        point_size = float(extent / scale) if extent != 0 else 1.0
+        for i, p in enumerate(pts_list):
+            color = colors[i % len(colors)]
+            psize = float(global_extent / scale) # FIX: TraitError cast
+            
+            plot += k3d.points(
+                p.astype(np.float32), 
+                point_size=psize, 
+                color=color,
+                #shader="flat",
+                name=f"Point Set {i}"
+            )
 
-        # Assuming input is (3, N) -> Transpose to (N, 3) for K3D
-        points_obj = k3d.points(
-            positions=points.T, 
-            point_size=point_size, 
-            color=color,
-            name=f"Plot {i+1}"
-        )
+    # --- 2. Process and Plot Cameras ---
+    if camera_input is not None:
+        if not isinstance(camera_input, (list, tuple)):
+            camera_input = [camera_input]
+            
+        cam_size = global_extent * 0.12 # Base size for the camera geometry
         
-        plot += points_obj
+        for i, P in enumerate(camera_input):
+            C, R, U, F = get_orthogonal_camera_vectors(P)
+            
+            # Construct the Frustum geometry
+            dist = cam_size
+            w, h = cam_size * 0.8, cam_size * 0.6
+            
+            # 4 corners of the image plane
+            c1 = C + F*dist + R*w + U*h
+            c2 = C + F*dist - R*w + U*h
+            c3 = C + F*dist - R*w - U*h
+            c4 = C + F*dist + R*w - U*h
+            
+            corners = np.array([c1, c2, c3, c4], dtype=np.float32)
+            verts = np.vstack([C, corners]).astype(np.float32)
+            
+            # Indices for 8 lines: 4 rays from center + 4 lines for the rectangle
+            indices = np.array([
+                [0,1], [0,2], [0,3], [0,4], 
+                [1,2], [2,3], [3,4], [4,1],[1,2]
+            ], dtype=np.uint32)
+            
+            # Main Frustum Box (Thin white lines)
+            plot += k3d.lines(
+                verts, indices, 
+                color=0xff0000, 
+                width=float(cam_size * 0.015),
+                name=f"Camera {i} Box"
+            )
+
+            # RGB Orientation Tripod at Camera Center
+            # (Red: Right, Green: Up, Blue: Forward)
+            a_len = cam_size * 0.4
+            tripod_width = float(cam_size * 0.04)
+            
+            plot += k3d.lines(np.vstack([C, C + R*a_len]).astype(np.float32), [[0,1]], color=0xff0000, width=tripod_width)
+            plot += k3d.lines(np.vstack([C, C + U*a_len]).astype(np.float32), [[0,1]], color=0x00ff00, width=tripod_width)
+            plot += k3d.lines(np.vstack([C, C + F*a_len]).astype(np.float32), [[0,1]], color=0x0000ff, width=tripod_width)
+
+            # Optical Center (small white sphere)
+            plot += k3d.points(
+                C.reshape(1,3).astype(np.float32), 
+                point_size=float(cam_size * 0.1), 
+                color=0xffffff
+            )
 
     plot.display()
 

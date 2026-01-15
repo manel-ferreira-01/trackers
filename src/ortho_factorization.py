@@ -75,7 +75,7 @@ def marques_factorization(obs_mat: torch.Tensor):
     A = torch.stack(A_rows, dim=0)  # (3*num_frames, 6)
     b = torch.tensor(b, dtype=dtype, device=device).unsqueeze(1)  # (3*num_frames, 1)
 
-    # Build the alpha constraints (Metric constraints)
+    # Build the alpha constraints (Metr3ic constraints)
     # This structure remains valid: for every frame we have 3 equations, 
     # and we want the first two (norms) to be equal to alpha.
     mat = torch.kron(
@@ -467,26 +467,64 @@ def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-
     offsets = torch.stack(offsets)
     return scales, offsets, W, first_iter_W, z
 
-def random_affine_camera(device=None, dtype=torch.float32):
+import torch
+
+def random_camera(camera_type="affine", device=None, dtype=torch.float32):
     """
-    Returns a random 2x4 affine camera matrix P_f = [M_f | T_f].
-    M_f (2x3 orthographic projection) has orthonormal rows.
-    T_f (2x1 translation vector) is a random 2D vector.
+    Returns a random camera matrix.
+    
+    Args:
+        camera_type (str): "affine" (2x4) or "projective" (3x4).
+        device: torch device.
+        dtype: torch data type.
+        
+    Returns:
+        P: The camera matrix.
     """
     if device is None:
         device = torch.device("cpu")
 
-    # 1. Generate the 2x3 Orthographic Projection (M_f)
-    # Sample a 3x3 Gaussian matrix
+    # --- 1. Generate Rotation (Common to both) ---
+    # Using QR decomposition of a random matrix to get a valid rotation matrix R
     A = torch.randn(3, 3, device=device, dtype=dtype)
     Q, R = torch.linalg.qr(A)
+    if torch.linalg.det(Q) < 0:
+        Q[:, 0] *= -1
 
-    # Fix sign (optional, but good practice for unique decomposition)
-    d = torch.sign(torch.diag(R))
-    d[d == 0] = 1.0
-    Q = Q @ torch.diag(d)
+    #d = torch.sign(torch.diag(R))
+    #d[d == 0] = 1.0
+    R_ext = Q #@ torch.diag(d)
 
-    M_f = Q[:2, :]  # shape = [2, 3]
-    T_f = torch.randn(2, 1, device=device, dtype=dtype) # shape = [2, 1]
-    P_f = torch.cat((M_f, T_f), dim=1) # shape = [2, 4]
-    return P_f
+    # --- 2. Generate Translation ---
+    t = torch.randn(3, 1, device=device, dtype=dtype)
+
+    if camera_type == "affine":
+        # Affine P = [M | T] where M is 2x3 and T is 2x1
+        # We take the first two rows of the rotation and translation
+        M_f = R_ext[:2, :] 
+        T_f = t[:2, :]
+        P = torch.cat((M_f, T_f), dim=1) # Shape: [2, 4]
+
+    elif camera_type == "projective":
+        # Projective P = K [R | t]
+        # Generate a random Intrinsic Matrix K (Upper triangular)
+        # Standard defaults: focal length ~500, principal point ~250
+        f = torch.rand(1, device=device, dtype=dtype) * 500 + 250
+        px, py = torch.rand(2, device=device, dtype=dtype) * 100 + 250
+        
+        K = torch.tensor([
+            [f, 0, px],
+            [0, f, py],
+            [0, 0, 1]
+        ], device=device, dtype=dtype)
+        
+        # Extrinsic matrix [R | t]
+        Rt = torch.cat((R_ext, t), dim=1) # Shape: [3, 4]
+        
+        # Final P = K @ Rt
+        P = torch.eye(3) @ Rt # Shape: [3, 4]
+        
+    else:
+        raise ValueError("camera_type must be 'affine' or 'projective'")
+
+    return P
