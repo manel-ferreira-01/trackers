@@ -80,12 +80,23 @@ def build_depth_weighted_matrix(tracks, depths: torch.Tensor, Ks):
     rays2d = torch.stack([x_norm, y_norm], dim=1)
     rays2d = rays2d.reshape(2 * F, P)
 
-    rays2d_norm, T = hartley_normalize_stacked(rays2d)
+    rays3d = make_homogenous(rays2d)  # [3F, P]
 
-    W_proj = rays2d_norm * z.repeat_interleave(2, dim=0)
+    return rays3d, z
 
-    return W_proj, z, T, rays2d
+def make_homogenous(obs_mat):
+    F2, P = obs_mat.shape
+    F = F2 // 2
+    device = obs_mat.device
+    dtype = obs_mat.dtype
 
+    obs_reshaped = obs_mat.view(F, 2, P)
+
+    ones = torch.ones((F, 1, P), device=device, dtype=dtype)
+
+    obs_combined = torch.cat([obs_reshaped, ones], dim=1)
+    obs_homog = obs_combined.view(3 * F, P)
+    return obs_homog
 
 def hartley_normalize_stacked(W):
     """
@@ -280,8 +291,11 @@ def projective_factorization(obs_mat_scaled):
         m1.T @ Q @ m2 = b
         """
         return torch.tensor([
-            m1[0]*m2[0], m1[0]*m2[1] + m1[1]*m2[0], m1[0]*m2[2] + m1[2]*m2[0],
-            m1[1]*m2[1], m1[1]*m2[2] + m1[2]*m2[1],
+            m1[0]*m2[0],
+            m1[0]*m2[1] + m1[1]*m2[0],
+            m1[0]*m2[2] + m1[2]*m2[0],
+            m1[1]*m2[1],
+            m1[1]*m2[2] + m1[2]*m2[1],
             m1[2]*m2[2]
         ], device=m1.device, dtype=m1.dtype)
 
@@ -316,26 +330,64 @@ def projective_factorization(obs_mat_scaled):
 
     # 4. Extract Transformation L
     # Ensure Q is positive definite (Numerical stability)
-    eigvals, eigvecs = torch.linalg.eigh(Q)
-    eigvals = torch.clamp(eigvals, min=1e-6)
-    L = eigvecs @ torch.diag(torch.sqrt(eigvals))
+    U, S_diag, Vh = torch.linalg.svd(Q)
+    S_diag = torch.clamp(S_diag, min=1e-9)
+    L = U @ torch.diag(torch.sqrt(S_diag))
 
     # 5. Final Metric Reconstruction
     M = M_hat @ L
     S = torch.linalg.inv(L) @ S_hat
 
-    R_1 = M[0:3, :3]
-    det = torch.linalg.det(R_1)
+    # procrustes on the motion matrices
+    scales = []
+    for f in range(num_frames):
+        Mi = M[3*f : 3*(f+1), :]
+        U_m, S_m, Vh_m = torch.linalg.svd(Mi)
+        R = U_m @ Vh_m
+        if torch.linalg.det(R) < 0:
+            R *= -1
+        M[3*f : 3*(f+1), :] = R
+        scales.append(S_m.mean())
 
-    if det < 0:
-        # We are in a left-handed (mirrored) system.
-        # Flip exactly ONE column of L. This changes the handedness 
-        # of the transformation without breaking the orthogonality.
-        L[:, 0] *= -1
+    return M , S, T_vec, torch.stack(scales)
+
+import torch
+import numpy as np
+
+
+def get_subspace_outlier_indices(W, rank=4, threshold=100.0, use_relative=False, viz = True):
+
+    # 1. SVD to find the basis
+    u, s, v = torch.linalg.svd(W, full_matrices=False)
+    Ub = u[:, :rank]
+    
+    # 2. Project onto the null space (orthogonal complement)
+    # Equivalent to: W - (Ub @ Ub.T @ W)
+    p_null = torch.eye(Ub.shape[0], device=W.device) - Ub @ Ub.T
+    wp = p_null @ W
+    
+    # 3. Calculate squared Frobenius norm per column (residual error)
+    residuals = torch.sum(wp * wp, dim=0)
+    
+    # 4. Determine Threshold
+    if use_relative:
+        # Using 3x Median Absolute Deviation is a common robust statistical approach
+        cutoff = torch.median(residuals) * threshold 
+    else:
+        cutoff = threshold
+    print(torch.median(residuals))
+    
+    if viz:
+        import matplotlib.pyplot as plt
+        plt.plot(residuals.cpu().numpy(), label="Residuals")
+        plt.axhline(cutoff, color='red', linestyle='--', label=f"Threshold ({'Relative' if use_relative else 'Absolute'})")
+        plt.yscale("log")
+        plt.xlabel("Feature Index")
+        print("Number of outliers detected:", torch.sum(residuals > cutoff).item())
         
-        # Re-calculate M and S with the corrected L
-        M = M_hat @ L
-        S = torch.linalg.inv(L) @ S_hat
-
-    return M, S, T_vec
-
+    # 5. Get indices where residual exceeds threshold
+    outlier_mask = residuals > cutoff
+    outlier_indices = torch.nonzero(outlier_mask).flatten()
+    new_W = W[:, ~outlier_mask]
+    
+    return new_W, outlier_mask, residuals

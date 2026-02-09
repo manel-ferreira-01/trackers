@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 from tqdm import tqdm
+from src.projective_factorization import projective_factorization
+
 
 def marques_factorization(obs_mat: torch.Tensor):
     """
@@ -284,28 +286,10 @@ def _norm_uv_per_frame(tracks, K):
 
     return x, y
 
-def _build_W_ortho(x, y, lam, d, s):
-    """ Build the orthographic measurement matrix W given the parameters.
-    Args:
-        x: normalized x coordinates [F,P]
-        y: normalized y coordinates [F,P]
-        lam: depth scaling factors [F,P]
-        d: scale per frame [F]
-        s: translation per frame [F]
-    Returns:
-        W: measurement matrix [2F,P]
-        z: depth adjusted scaling factors [F,P]
-    """
-    z = d[:,None]*lam + s[:,None]
-    W = torch.empty((2*lam.shape[0], lam.shape[1]), device=lam.device, dtype=lam.dtype)
-    W[0::2] = x * z
-    W[1::2] = y * z
-    return W, z
-
 @torch.no_grad()
 def _update_affine_ortho(x, y, lam, M, eps=1e-6, clamp_pos=True):
     F, P = lam.shape
-    Mx, My = M[0::2], M[1::2]
+    Mx, My = M[0::3], M[1::3]
 
     X2Y2 = x**2 + y**2              # [F,P]
     L = lam
@@ -337,7 +321,7 @@ def _update_affine_ortho_lstsq(x, y, lam, M):
         d, s : [F] scale and shift per frame
     """
     F, P = lam.shape
-    Mx, My = M[0::2], M[1::2]   # split 2×P blocks
+    Mx, My, Mz = M[0::3], M[1::3], M[2::3]   # split 2×P blocks
 
     d = torch.empty(F, device=lam.device, dtype=lam.dtype)
     s = torch.empty(F, device=lam.device, dtype=lam.dtype)
@@ -345,12 +329,11 @@ def _update_affine_ortho_lstsq(x, y, lam, M):
     for f in range(F):
         # Design matrix A_f : [2P, 2]
         A_f = torch.stack([
-            torch.cat([x[f] * lam[f], y[f] * lam[f]]),   # column 1
-            torch.cat([x[f], y[f]])                      # column 2
-        ], dim=1).reshape(2*P, 2)
-
+            torch.cat([x[f] * lam[f], y[f] * lam[f], lam[f]]),   # column 1
+            torch.cat([x[f], y[f], torch.ones_like(lam[f])])                      # column 2
+        ], dim=1).reshape(3*P, 2)
         # Target vector B_f : [2P]
-        B_f = torch.cat([Mx[f], My[f]])
+        B_f = torch.cat([Mx[f], My[f], Mz[f]])
 
         # Solve least squares (min ||A_f θ - B_f||^2)
         theta_f, *_ = torch.linalg.lstsq(A_f, B_f)
@@ -358,53 +341,59 @@ def _update_affine_ortho_lstsq(x, y, lam, M):
 
     return d, s
 
-def _update_affine_ortho_shift_only(x, y, lam, M):
+def _update_projective_shift_only(tracks_homog, lam, M):
     """
-    Orthographic per-frame least squares update (Shift 's' only, d=1).
-
-    Solves: s * [x, y] = M - lam * [x, y]
+    Projective per-frame least squares update for shift 's'.
+    Works with 3 lines per frame: [x, y, 1].
     
     Args:
-        x, y : [F, P] normalized image coordinates
-        lam  : [F, P] raw monocular depths (λ)
-        M    : [2F, P] target low-rank reconstruction
-
+        tracks_homog : [3F, P] matrix [x0, y0, 1, x1, y1, 1, ...]^T
+        lam          : [F, P] depths
+        M            : [3F, P] low-rank reconstruction
+        
     Returns:
-        d : [F] Fixed to 1s
         s : [F] shift per frame
     """
     F, P = lam.shape
-    Mx, My = M[0::2], M[1::2]   # split 2×P blocks
-
-    # d is fixed to 1
-    d = torch.ones(F, device=lam.device, dtype=lam.dtype)
-    s = torch.empty(F, device=lam.device, dtype=lam.dtype)
+    device = lam.device
+    dtype = lam.dtype
+    
+    s = torch.empty(F, device=device, dtype=dtype)
 
     for f in range(F):
-        # 1. Construct the regressor for s (This corresponds to column 2 of the old A_f)
-        # Vector A: [2P] -> The image coordinates
-        u_vec = torch.cat([x[f], y[f]]) 
-
-        # 2. Construct the target residual (Target - Known Depth Component)
-        # Vector B': [2P] -> (Target M) - (Raw Depth * Coords)
-        target_vec = torch.cat([Mx[f], My[f]])
-        known_depth_vec = torch.cat([x[f] * lam[f], y[f] * lam[f]])
+        # 1. Extract the 3 rows for this frame
+        # tracks_homog is [x, y, 1] interleaved
+        u_frame = tracks_homog[3*f : 3*f+3, :] # [3, P]
+        m_frame = M[3*f : 3*f+3, :]            # [3, P]
         
-        rhs = target_vec - known_depth_vec
-
-        # 3. Solve for s using closed form: s = (A . B') / (A . A)
-        numerator = torch.dot(u_vec, rhs)
-        denominator = torch.dot(u_vec, u_vec)
+        # 2. Flatten to vectors for dot product
+        # A is the regressor: [x, y, 1]
+        A = u_frame.reshape(-1) 
         
-        # Add a small epsilon to denominator to prevent division by zero if coords are all 0
+        # 3. Target B is (LowRank M) - (lambda * [x, y, 1])
+        target_val = m_frame.reshape(-1)
+        depth_component = (lam[f].repeat(3) * A) # lambda multiplied across x, y, 1
+        
+        # Correctly applying lambda: each lambda[f,p] scales [x_fp, y_fp, 1]
+        # Using broadcasting for clarity:
+        rhs_frame = m_frame - (lam[f] * u_frame)
+        B = rhs_frame.reshape(-1)
+
+        # 4. Solve: s = (A . B) / (A . A)
+        numerator = torch.dot(A, B)
+        denominator = torch.dot(A, A)
+        
         s[f] = numerator / (denominator + 1e-8)
 
-    return d, s
+    return s
 
 
-def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-6,
+def calibrate_orthographic(tracks, lam, K, rank=4, iters=10, tol=1e-5, ridge=1e-6,
                            init_scales=None, init_offsets=None):
-    x, y = _norm_uv_per_frame(tracks, K)
+
+    #x, y = _norm_uv_per_frame(tracks, K)
+    x , y = tracks[0::3,:], tracks[1::3,:] 
+
     F, P = lam.shape
 
     if init_scales is not None:
@@ -424,48 +413,51 @@ def calibrate_orthographic(tracks, lam, K, rank=3, iters=10, tol=1e-5, ridge=1e-
 
     best = (float('inf'), d.clone(), s.clone(), None)
     Mprev = None
-    first_iter_W = _build_W_ortho(x, y, lam, d, s)[0]
+    
+    first_iter_W = (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
+    
+    print(first_iter_W.shape)
 
     for iter in tqdm(range(iters)):
 
-        W, _ = _build_W_ortho(x, y, lam, d, s)
-        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-        M = (U[:, :rank] * S[:rank]) @ Vh[:rank]
-        #M = marques_factorization(M)[0]
+        W= (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
+        
+        if 0:
+            motion, shape, tvec, _ = projective_factorization(Wn)
+            Wn = torch.cat((motion, tvec), dim=1) @ torch.cat((shape, torch.ones(1, P)), dim=0)
+        else:
+            U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+            M = (U[:, :rank] * S[:rank]) @ Vh[:rank]
 
-        #d, s = _update_affine_ortho(x, y, lam, M, eps=ridge)
-        #d, s = _update_affine_ortho_lstsq(x, y, lam, M)
-        _, s = _update_affine_ortho_shift_only(x,y,lam,M)
+
+        _, s = _update_affine_ortho_lstsq(x, y, lam, M)
+        #s = _update_projective_shift_only(tracks,lam,M)
+        #_, s = _update_affine_ortho(x, y, lam, M)
 
         # normalize d and s to avoid numerical issues, 
         #d = d / torch.norm(d)
         d = torch.ones_like(d)
+        #s = s - s[0]
 
         scales.append(d.clone())
         offsets.append(s.clone())
 
-        Wn, _ = _build_W_ortho(x, y, lam, d, s)
+        Wn = (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
         
-        # at each iteration, project the whole matrix into the motion manifold
-        #Wn = marques_factorization(Wn)[0]
-        #Wn = costeira_marques(Wn)[-1]
-
         #rho = (torch.norm(Wn - M) / (torch.norm(Wn) + 1e-12)).item()
         rho = (torch.norm(Wn - M)).item()
         if rho < best[0] - tol:
             best = (rho, d.clone(), s.clone(), M.clone())
         else:
-            if iter > 4000:
+            if iter > 10000:
                 print(rho)
                 break
 
-        Mprev = M
-
     _, d, s, M = best
-    W, z = _build_W_ortho(x, y, lam, d, s)
+    W = (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
     scales = torch.stack(scales)
     offsets = torch.stack(offsets)
-    return scales, offsets, W, first_iter_W, z
+    return scales, offsets, W, first_iter_W
 
 import torch
 

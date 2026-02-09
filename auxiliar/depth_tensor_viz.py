@@ -38,7 +38,7 @@ def get_orthogonal_camera_vectors(P):
     
     # Ensure a right-handed system (det == 1)
     if np.linalg.det(R_ortho) < 0:
-        R_ortho[:,0] *= -1
+        R_ortho *= 1
 
     # 4. Extract Orthogonal Axes
     # Row 0 = Right, Row 1 = Up (inverted for screen space), Row 2 = Forward
