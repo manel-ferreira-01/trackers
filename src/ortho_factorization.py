@@ -415,10 +415,8 @@ def calibrate_orthographic(tracks, lam, K, rank=4, iters=10, tol=1e-5, ridge=1e-
     Mprev = None
     
     first_iter_W = (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
-    
-    print(first_iter_W.shape)
 
-    for iter in tqdm(range(iters)):
+    for iter in (range(iters)):
 
         W= (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
         
@@ -437,7 +435,8 @@ def calibrate_orthographic(tracks, lam, K, rank=4, iters=10, tol=1e-5, ridge=1e-
         # normalize d and s to avoid numerical issues, 
         #d = d / torch.norm(d)
         d = torch.ones_like(d)
-        #s = s - s[0]
+        s = s - s[0]
+        #s = torch.abs(s)
 
         scales.append(d.clone())
         offsets.append(s.clone())

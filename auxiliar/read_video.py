@@ -12,75 +12,65 @@ from auxiliar.resize_crop import preprocess_images_batch
 
 decord.bridge.set_bridge('torch')
 
+import torch.nn.functional as F
+
 def read_video_or_images(path, mode="crop", device='cpu', target_size=518):
-    """
-    Reads a video or images, and preprocesses them using the specific
-    DINOv2-style preprocessing (518px resolution).
-
-    Args:
-        path (str): Path to a video file or folder of images.
-        mode (str): "pad" (preserves aspect ratio) or "crop" (square center crop).
-        device (str): Device to load the tensor onto ('cpu' or 'cuda').
-
-    Returns:
-        video_preprocessed (torch.Tensor): (num_frames, H, W, 3) normalized to [-1, 1].
-        video_original (torch.Tensor): (num_frames, H, W, 3) normalized to [-1, 1].
-    """
     frames = []
 
     if os.path.isdir(path):
         # --- Read images from folder ---
         image_files = sorted(glob(os.path.join(path, "*")), key=lambda x: os.path.basename(x))
+        
+        raw_frames = []
+        max_h, max_w = 0, 0
+        
         for img_path in tqdm(image_files, desc="Reading images", unit="img"):
             img = cv.imread(img_path)
-            if img is None:
-                continue
-            # OpenCV reads BGR, convert to RGB
+            if img is None: continue
+            
             frame_rgb = cv.cvtColor(img, cv.COLOR_BGR2RGB)
-            frames.append(torch.from_numpy(frame_rgb))
+            f_tensor = torch.from_numpy(frame_rgb).float() # (H, W, 3)
+            
+            # Track max dimensions for padding
+            h, w, _ = f_tensor.shape
+            max_h = max(max_h, h)
+            max_w = max(max_w, w)
+            raw_frames.append(f_tensor)
         
-        if not frames:
+        if not raw_frames:
             raise ValueError(f"No valid images found in folder: {path}")
-        
-        video_tensor = torch.stack(frames).float()  # (F, H, W, 3)
+
+        # --- Pad images to common size (max_h, max_w) ---
+        padded_frames = []
+        for f in raw_frames:
+            h, w, _ = f.shape
+            pad_h = max_h - h
+            pad_w = max_w - w
+            
+            # F.pad expects (Padding_Left, Padding_Right, Padding_Top, Padding_Bottom)
+            # We pad trailing edges (Right and Bottom) to maintain top-left alignment
+            # Note: We permute to (C, H, W) for padding, then back
+            f_padded = F.pad(f.permute(2, 0, 1), (0, pad_w, 0, pad_h), value=0)
+            padded_frames.append(f_padded.permute(1, 2, 0))
+            
+        video_tensor = torch.stack(padded_frames)  # (F, H, W, 3)
 
     else:
-        # --- Read video using Decord ---
+        # --- Read video using Decord (Standard sizing assumed for video streams) ---
         ctx = gpu(0) if device.startswith("cuda") else cpu(0)
         vr = VideoReader(path, ctx=ctx)
-        num_frames = len(vr)
+        video_tensor = torch.stack([f for f in vr]).float()
 
-        # Decord returns (F, H, W, 3) directly if using batch retrieval, 
-        # but looping is safer for memory if needed. 
-        # Here we stick to your loop pattern for consistency.
-        frames = []
-        for i in tqdm(range(num_frames), desc=f"Reading video: {os.path.basename(path)}", unit="frame"):
-            frame = vr[i] 
-            frames.append(frame)
-        
-        video_tensor = torch.stack(frames).float()  # (F, H, W, 3)
+    # --- Standardize and Return ---
+    video_original = video_tensor.clone().div(255).sub(0.5).mul(2).to(device)
 
-    # --- Store original video (Normalize to [-1, 1] for return) ---
-    # Clone because the next steps will modify data
-    video_original = video_tensor.clone()
-    video_original = video_original.div(255).sub(0.5).mul(2).to(device)
-
-    # --- Prepare for Preprocessing ---
-    # 1. Convert to (F, C, H, W) -> Required by preprocess_images_batch
-    # 2. Normalize to [0, 1] -> Required by preprocess_images_batch
+    # Convert to (F, C, H, W) and scale to [0, 1] for preprocessing
     model_input = video_tensor.permute(0, 3, 1, 2).div(255.0)
 
-    # --- Apply the Preprocessing Logic ---
-    # This handles the resizing to 518px, padding/cropping, and ensures divisibility by 14
-    # We do this on CPU to avoid OOM on GPU for large batches, unless you have plenty of VRAM
+    # This function now receives a uniform batch
     preprocessed_batch = preprocess_images_batch(model_input, target_size=target_size)
 
-    # --- Finalize Output ---
-    # 1. Convert [0, 1] back to [-1, 1] (as per your original function's logic)
-    video_preprocessed = preprocessed_batch.sub(0.5).mul(2)
-
-    # 2. Permute back to (F, H, W, 3) (Channel Last)
-    video_preprocessed = video_preprocessed.permute(0, 2, 3, 1)
+    video_preprocessed = preprocessed_batch.sub(0.5).mul(2).permute(0, 2, 3, 1)
 
     return video_preprocessed.to(device), video_original
 

@@ -48,97 +48,167 @@ def get_orthogonal_camera_vectors(P):
     
     return C, right, up, forward
 
-def k3d_3d_plot(point_input, camera_input=None, scale=70):
-    plot = k3d.plot(camera_auto_fit=True)
+def k3d_3d_plot(point_input, color_input=None, camera_input=None, scale=70):
+    """
+    Visualizes 3D points and cameras using K3D.
     
-    # High-visibility color palette
-    colors = [
-        0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 
+    Args:
+        point_input: 
+            - A single Nx3 array/tensor of points.
+            - OR a list of [N1x3, N2x3, ...] arrays/tensors.
+        color_input: (Optional)
+            - If None: Each set in point_input gets a unique color from a default palette.
+            - If provided: Must match the structure of point_input.
+            - Can be a list of [N1x3, N2x3, ...] RGB values (0-1 float or 0-255 int).
+            - Can be a list of [N1, N2, ...] packed uint32 integers (0xRRGGBB).
+        camera_input: (Optional)
+            - A list of 3x4 or 4x4 camera projection matrices (World-to-Camera or Cam-to-World).
+        scale: 
+            - Float used to determine point and camera size relative to scene extent.
+    """
+    
+    plot = k3d.plot(camera_auto_fit=True)
+
+    # Standard colormap for when no color_input is provided
+    default_colors = [
+        0xff0000, 0x00ff00, 0x0000ff, 0xffff00,
         0x00ffff, 0xff00ff, 0xffa500, 0x800080
     ]
-    
-    # --- 1. Process and Plot Points ---
-    global_extent = 1.0
+
+    # -------------------------
+    # POINTS
+    # -------------------------
     if point_input is not None:
+        # Normalize inputs to lists
         if not isinstance(point_input, (list, tuple)):
             point_input = [point_input]
         
+        if color_input is not None and not isinstance(color_input, (list, tuple)):
+            color_input = [color_input]
+
         pts_list = []
         for p in point_input:
             if torch.is_tensor(p): p = p.detach().cpu().numpy()
             p = p.T if p.shape[0] == 3 else p
-            pts_list.append(p)
-            
-        # Determine scene scale for sizing everything else
+            pts_list.append(p.astype(np.float32))
+
+        # Calculate scale based on the whole scene
         combined = np.vstack(pts_list)
         mins, maxs = combined.min(axis=0), combined.max(axis=0)
         global_extent = np.linalg.norm(maxs - mins)
         if global_extent == 0: global_extent = 1.0
+        psize = float(global_extent / scale)
 
+        # Plot each set
         for i, p in enumerate(pts_list):
-            color = colors[i % len(colors)]
-            psize = float(global_extent / scale) # FIX: TraitError cast
-            
-            plot += k3d.points(
-                p.astype(np.float32), 
-                point_size=psize, 
-                color=color,
-                #shader="flat",
-                name=f"Point Set {i}"
-            )
+            params = {
+                "point_size": psize,
+                "name": f"Point Set {i}",
+                #"shader": "flat"
+            }
 
-    # --- 2. Process and Plot Cameras ---
+            if color_input is not None and i < len(color_input):
+                # PER-POINT COLOR MODE
+                c = color_input[i]
+                if torch.is_tensor(c): c = c.detach().cpu().numpy()
+                
+                # If colors are [N, 3], pack them into uint32
+                if c.ndim == 2 and c.shape[1] == 3:
+                    if c.max() <= 1.1: c = (c * 255)
+                    c = c.astype(np.uint32)
+                    c = (c[:, 0] << 16) | (c[:, 1] << 8) | c[:, 2]
+                
+                params["colors"] = c.astype(np.uint32)
+            else:
+                # DEFAULT COLORMAP MODE
+                params["color"] = default_colors[i % len(default_colors)]
+
+            plot += k3d.points(p, **params)
+    else:
+        global_extent = 1.0
+
+    # -------------------------
+    # CAMERAS (HEAVILY OPTIMIZED)
+    # -------------------------
     if camera_input is not None:
+
         if not isinstance(camera_input, (list, tuple)):
             camera_input = [camera_input]
-            
-        cam_size = global_extent * 0.12 # Base size for the camera geometry
-        
-        for i, P in enumerate(camera_input):
+
+        cam_size = global_extent * 0.12
+
+        all_verts = []
+        all_inds = []
+        optical_centers = []
+
+        offset = 0
+
+        for P in camera_input:
+
             C, R, U, F = get_orthogonal_camera_vectors(P)
-            
-            # Construct the Frustum geometry
+
+            C = C.astype(np.float32)
+            R = R.astype(np.float32)
+            U = U.astype(np.float32)
+            F = F.astype(np.float32)
+
             dist = cam_size
             w, h = cam_size * 0.8, cam_size * 0.6
-            
-            # 4 corners of the image plane
+
             c1 = C + F*dist + R*w + U*h
             c2 = C + F*dist - R*w + U*h
             c3 = C + F*dist - R*w - U*h
             c4 = C + F*dist + R*w - U*h
-            
-            corners = np.array([c1, c2, c3, c4], dtype=np.float32)
-            verts = np.vstack([C, corners]).astype(np.float32)
-            
-            # Indices for 8 lines: 4 rays from center + 4 lines for the rectangle
-            indices = np.array([
-                [0,1], [0,2], [0,3], [0,4], 
-                [1,2], [2,3], [3,4], [4,1],[1,2]
+
+            verts = np.vstack([C, c1, c2, c3, c4]).astype(np.float32)
+
+            # Frustum lines
+            inds = np.array([
+                [0,1],[0,2],[0,3],[0,4],
+                [1,2],[2,3],[3,4],[4,1]
             ], dtype=np.uint32)
-            
-            # Main Frustum Box (Thin white lines)
-            plot += k3d.lines(
-                verts, indices, 
-                color=0xff0000, 
-                width=float(cam_size * 0.015),
-                name=f"Camera {i} Box"
-            )
 
-            # RGB Orientation Tripod at Camera Center
-            # (Red: Right, Green: Up, Blue: Forward)
+            # Tripod axes
             a_len = cam_size * 0.4
-            tripod_width = float(cam_size * 0.04)
-            
-            plot += k3d.lines(np.vstack([C, C + R*a_len]).astype(np.float32), [[0,1]], color=0xff0000, width=tripod_width)
-            plot += k3d.lines(np.vstack([C, C + U*a_len]).astype(np.float32), [[0,1]], color=0x00ff00, width=tripod_width)
-            plot += k3d.lines(np.vstack([C, C + F*a_len]).astype(np.float32), [[0,1]], color=0x0000ff, width=tripod_width)
 
-            # Optical Center (small white sphere)
-            plot += k3d.points(
-                C.reshape(1,3).astype(np.float32), 
-                point_size=float(cam_size * 0.1), 
-                color=0xffffff
-            )
+            tripod_verts = np.vstack([
+                C, C + R*a_len,
+                C, C + U*a_len,
+                C, C + F*a_len
+            ]).astype(np.float32)
+
+            tripod_inds = np.array([
+                [5,6],
+                [7,8],
+                [9,10]
+            ], dtype=np.uint32)
+
+            # Merge verts
+            merged = np.vstack([verts, tripod_verts])
+
+            all_verts.append(merged)
+            all_inds.append(np.vstack([inds, tripod_inds]) + offset)
+
+            offset += merged.shape[0]
+
+            optical_centers.append(C)
+
+        # SINGLE draw call for ALL cameras
+        plot += k3d.lines(
+            np.vstack(all_verts),
+            np.vstack(all_inds),
+            color=0xff0000,
+            width=float(cam_size * 0.02),
+            shader="simple"
+        )
+
+        # ONE object for all optical centers
+        plot += k3d.points(
+            np.vstack(optical_centers),
+            point_size=float(cam_size * 0.12),
+            color=0x000000,
+            shader="flat"
+        )
 
     plot.display()
 

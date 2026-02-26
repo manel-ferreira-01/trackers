@@ -316,17 +316,31 @@ def projective_factorization(obs_mat_scaled):
         A_rows.append(constraint_torch(my, mz)); b_rows.append(0.0)
 
     A = torch.stack(A_rows)
-    b = torch.tensor(b_rows, device=device, dtype=dtype).unsqueeze(1)
+    b = torch.tensor(b_rows, device=device, dtype=dtype).unsqueeze(1) # (6*num_frames, 1)
+
+    mat = torch.kron(
+        torch.eye(num_frames, dtype=dtype, device=device), 
+        torch.tensor([[-1.0, -1.0, -1.0, 0.0, 0.0, 0.0]], dtype=dtype, device=device).reshape(6,1)
+    )
+
+    A = torch.cat([A, -b], dim=1)
 
     # Solve for Q (Linear Least Squares: A @ q = b)
     # q is the 6 parameters of the symmetric matrix Q = L @ L.T
-    q = torch.linalg.lstsq(A, b).solution.flatten()
+    _, _, Vh_full = torch.linalg.svd(A)
+    l = Vh_full[-1] # This is our [q1...q6, a1^2...aF^2]
+
+    l = l / l[6] 
+    
+    q_vec = l[:6]
+    #alphas_sq = l[6:]
+
+    #print("alphas_sq", alphas_sq)
 
     Q = torch.tensor([
-        [q[0], q[1], q[2]],
-        [q[1], q[3], q[4]],
-        [q[2], q[4], q[5]]
-    ], device=device, dtype=dtype)
+        [q_vec[0], q_vec[1], q_vec[2]],
+        [q_vec[1], q_vec[3], q_vec[4]],
+        [q_vec[2], q_vec[4], q_vec[5]]], device=device, dtype=dtype)
 
     # 4. Extract Transformation L
     # Ensure Q is positive definite (Numerical stability)
@@ -349,45 +363,91 @@ def projective_factorization(obs_mat_scaled):
         M[3*f : 3*(f+1), :] = R
         scales.append(S_m.mean())
 
-    return M , S, T_vec, torch.stack(scales)
+    return M , S, T_vec, torch.stack(scales) #/ torch.sqrt(alphas_sq)
 
 import torch
 import numpy as np
+import torch
+import matplotlib.pyplot as plt
 
+def get_subspace_outlier_indices(W, rank=4, threshold=100.0, use_relative=False, 
+                                 mode='svd', iterations=100, viz=True):
+    """
+    Detects column outliers by projecting data onto a subspace.
+    
+    Modes:
+        'svd'   : Standard SVD-based projection (sensitive to outliers).
+        'ransac': Robustly samples columns to find the best subspace.
+    """
+    device = W.device
+    D, N = W.shape
+    
+    if mode == 'svd':
+        # 1. Standard SVD to find the basis
+        u, s, v = torch.linalg.svd(W, full_matrices=False)
+        Ub = u[:, :rank]
+        
+        # 2. Project onto null space and calculate residuals
+        p_null = torch.eye(D, device=device) - Ub @ Ub.T
+        residuals = torch.norm(p_null @ W, dim=0)**2 # Squared Frobenius norm
+        
+    elif mode == 'ransac':
+        best_inlier_count = -1
+        best_mask = None
+        sample_size = rank # Minimum columns to define a rank-r subspace
+        
+        for i in range(iterations):
+            # 1. Randomly sample columns
+            perm = torch.randperm(N, device=device)[:sample_size]
+            W_sample = W[:, perm]
+            
+            # 2. Get basis via QR (faster than SVD for small tall matrices)
+            # Q is the orthogonal basis for the sampled columns
+            Q, _ = torch.linalg.qr(W_sample)
+            Ub_h = Q[:, :rank]
+            
+            # 3. Project ALL columns onto null space of this hypothesis
+            p_null_h = torch.eye(D, device=device) - Ub_h @ Ub_h.T
+            res_h = torch.norm(p_null_h @ W, dim=0)**2
+            
+            # 4. Determine inliers based on current threshold
+            # Note: In RANSAC, 'threshold' usually refers to the distance error
+            inlier_mask = res_h < threshold
+            num_inliers = inlier_mask.sum()
+            
+            if num_inliers > best_inlier_count:
+                best_inlier_count = num_inliers
+                best_mask = inlier_mask
+        
+        # 5. Refinement: Re-estimate basis using ONLY the best inliers
+        W_inliers = W[:, best_mask]
+        u_final, _, _ = torch.linalg.svd(W_inliers, full_matrices=False)
+        Ub_final = u_final[:, :rank]
+        
+        p_null = torch.eye(D, device=device) - Ub_final @ Ub_final.T
+        residuals = torch.norm(p_null @ W, dim=0)**2
+        print(f"RANSAC finished {iterations} iterations. Inliers found: {best_inlier_count}")
 
-def get_subspace_outlier_indices(W, rank=4, threshold=100.0, use_relative=False, viz = True):
-
-    # 1. SVD to find the basis
-    u, s, v = torch.linalg.svd(W, full_matrices=False)
-    Ub = u[:, :rank]
-    
-    # 2. Project onto the null space (orthogonal complement)
-    # Equivalent to: W - (Ub @ Ub.T @ W)
-    p_null = torch.eye(Ub.shape[0], device=W.device) - Ub @ Ub.T
-    wp = p_null @ W
-    
-    # 3. Calculate squared Frobenius norm per column (residual error)
-    residuals = torch.sum(wp * wp, dim=0)
-    
-    # 4. Determine Threshold
+    # --- Thresholding Logic ---
     if use_relative:
-        # Using 3x Median Absolute Deviation is a common robust statistical approach
         cutoff = torch.median(residuals) * threshold 
     else:
         cutoff = threshold
-    print(torch.median(residuals))
-    
-    if viz:
-        import matplotlib.pyplot as plt
-        plt.plot(residuals.cpu().numpy(), label="Residuals")
-        plt.axhline(cutoff, color='red', linestyle='--', label=f"Threshold ({'Relative' if use_relative else 'Absolute'})")
-        plt.yscale("log")
-        plt.xlabel("Feature Index")
-        print("Number of outliers detected:", torch.sum(residuals > cutoff).item())
         
-    # 5. Get indices where residual exceeds threshold
     outlier_mask = residuals > cutoff
     outlier_indices = torch.nonzero(outlier_mask).flatten()
     new_W = W[:, ~outlier_mask]
     
+    if viz:
+        plt.figure(figsize=(10, 4))
+        plt.plot(residuals.cpu().numpy(), label="Residuals", alpha=0.7)
+        plt.axhline(cutoff.cpu().item() if torch.is_tensor(cutoff) else cutoff, 
+                    color='red', linestyle='--', label=f"Threshold ({mode})")
+        plt.yscale("log")
+        plt.title(f"Outlier Detection ({mode.upper()})")
+        plt.xlabel("Column Index")
+        plt.legend()
+        plt.show()
+        print(f"Number of outliers detected: {outlier_mask.sum().item()}")
+        
     return new_W, outlier_mask, residuals
