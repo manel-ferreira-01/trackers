@@ -62,8 +62,9 @@ def read_video_or_images(path, mode="crop", device='cpu', target_size=518):
         video_tensor = torch.stack([f for f in vr]).float()
 
     # --- Standardize and Return ---
-    video_original = video_tensor.clone().div(255).sub(0.5).mul(2).to(device)
+    #video_original = video_tensor.clone().div(255).sub(0.5).mul(2).to(device)
 
+    print("Original video tensor shape (F, H, W, C):", video_tensor.shape)
     # Convert to (F, C, H, W) and scale to [0, 1] for preprocessing
     model_input = video_tensor.permute(0, 3, 1, 2).div(255.0)
 
@@ -72,7 +73,9 @@ def read_video_or_images(path, mode="crop", device='cpu', target_size=518):
 
     video_preprocessed = preprocessed_batch.sub(0.5).mul(2).permute(0, 2, 3, 1)
 
-    return video_preprocessed.to(device), video_original
+    print("Preprocessed video tensor shape (F, H, W, C):", video_preprocessed.shape)
+
+    return video_preprocessed.to(device), image_files
 
 def resize_to_max_side(x, max_side=1024):
     """
