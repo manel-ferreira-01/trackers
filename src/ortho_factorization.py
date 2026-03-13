@@ -309,83 +309,32 @@ def _update_affine_ortho(x, y, lam, M, eps=1e-6, clamp_pos=True):
     return d, s
 
 def _update_affine_ortho_lstsq(x, y, lam, M):
-    """
-    Orthographic per-frame least squares update using the full matrix solver.
-
-    Args:
-        x, y : [F, P] normalized image coordinates
-        lam  : [F, P] raw monocular depths (λ)
-        M    : [2F, P] target low-rank reconstruction (USV^T)
-
-    Returns:
-        d, s : [F] scale and shift per frame
-    """
+    """Vectorized orthographic per-frame least squares — no Python loop."""
     F, P = lam.shape
-    Mx, My, Mz = M[0::3], M[1::3], M[2::3]   # split 2×P blocks
+    Mx, My, Mz = M[0::3], M[1::3], M[2::3]  # [F, P] each
 
-    d = torch.empty(F, device=lam.device, dtype=lam.dtype)
-    s = torch.empty(F, device=lam.device, dtype=lam.dtype)
+    # Build design matrix A: [F, 3P, 2]
+    col1 = torch.cat([x * lam, y * lam, lam], dim=1)          # [F, 3P]
+    col2 = torch.cat([x,       y,        torch.ones_like(x)], dim=1)  # [F, 3P]
+    A = torch.stack([col1, col2], dim=2)                        # [F, 3P, 2]
 
-    for f in range(F):
-        # Design matrix A_f : [2P, 2]
-        A_f = torch.stack([
-            torch.cat([x[f] * lam[f], y[f] * lam[f], lam[f]]),   # column 1
-            torch.cat([x[f], y[f], torch.ones_like(lam[f])])                      # column 2
-        ], dim=1).reshape(3*P, 2)
-        # Target vector B_f : [2P]
-        B_f = torch.cat([Mx[f], My[f], Mz[f]])
+    # Build target B: [F, 3P, 1]
+    B = torch.cat([Mx, My, Mz], dim=1).unsqueeze(-1)           # [F, 3P, 1]
 
-        # Solve least squares (min ||A_f θ - B_f||^2)
-        theta_f, *_ = torch.linalg.lstsq(A_f, B_f)
-        d[f], s[f] = theta_f
+    # Batched least squares: solve all F frames simultaneously
+    # lstsq expects [..., m, n] for A and [..., m, k] for B
+    theta, *_ = torch.linalg.lstsq(A, B)                       # [F, 2, 1]
+    theta = theta.squeeze(-1)                                   # [F, 2]
+    s   = theta[:, 0]        # scale
+    so  = theta[:, 1]        # this is s*o, NOT o
+    o   = so / (s + 1e-8)   # recover true offset
+    #print("s:", s)
+    #print("so:", so)
+    #print("o:", o)
 
-    return d, s
 
-def _update_projective_shift_only(tracks_homog, lam, M):
-    """
-    Projective per-frame least squares update for shift 's'.
-    Works with 3 lines per frame: [x, y, 1].
-    
-    Args:
-        tracks_homog : [3F, P] matrix [x0, y0, 1, x1, y1, 1, ...]^T
-        lam          : [F, P] depths
-        M            : [3F, P] low-rank reconstruction
-        
-    Returns:
-        s : [F] shift per frame
-    """
-    F, P = lam.shape
-    device = lam.device
-    dtype = lam.dtype
-    
-    s = torch.empty(F, device=device, dtype=dtype)
+    return s, o
 
-    for f in range(F):
-        # 1. Extract the 3 rows for this frame
-        # tracks_homog is [x, y, 1] interleaved
-        u_frame = tracks_homog[3*f : 3*f+3, :] # [3, P]
-        m_frame = M[3*f : 3*f+3, :]            # [3, P]
-        
-        # 2. Flatten to vectors for dot product
-        # A is the regressor: [x, y, 1]
-        A = u_frame.reshape(-1) 
-        
-        # 3. Target B is (LowRank M) - (lambda * [x, y, 1])
-        target_val = m_frame.reshape(-1)
-        depth_component = (lam[f].repeat(3) * A) # lambda multiplied across x, y, 1
-        
-        # Correctly applying lambda: each lambda[f,p] scales [x_fp, y_fp, 1]
-        # Using broadcasting for clarity:
-        rhs_frame = m_frame - (lam[f] * u_frame)
-        B = rhs_frame.reshape(-1)
-
-        # 4. Solve: s = (A . B) / (A . A)
-        numerator = torch.dot(A, B)
-        denominator = torch.dot(A, A)
-        
-        s[f] = numerator / (denominator + 1e-8)
-
-    return s
 
 
 def calibrate_orthographic(tracks, lam, K, rank=4, iters=10, tol=1e-5, ridge=1e-6,
@@ -397,21 +346,21 @@ def calibrate_orthographic(tracks, lam, K, rank=4, iters=10, tol=1e-5, ridge=1e-
     F, P = lam.shape
 
     if init_scales is not None:
-        d = init_scales.clone()
+        s = init_scales.clone()
     else:
-        d = torch.ones(F, device=lam.device, dtype=lam.dtype)  # scale
+        s = torch.ones(F, device=lam.device, dtype=lam.dtype)  # scale
     if init_offsets is not None:
-        s = init_offsets.clone()
+        o = init_offsets.clone()
     else:
-        s = torch.zeros(F, device=lam.device, dtype=lam.dtype)  #offset
+        o = torch.zeros(F, device=lam.device, dtype=lam.dtype)  #offset
 
     scales = []
     offsets = []
 
-    scales.append(d.clone())
-    offsets.append(s.clone())
+    scales.append(s.clone())
+    offsets.append(o.clone())
 
-    best = (float('inf'), d.clone(), s.clone(), None)
+    best = (float('inf'), s.clone(), o.clone(), None)
     Mprev = None
     
     first_iter_W = (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
@@ -427,32 +376,52 @@ def calibrate_orthographic(tracks, lam, K, rank=4, iters=10, tol=1e-5, ridge=1e-
             U, S, Vh = torch.linalg.svd(W, full_matrices=False)
             M = (U[:, :rank] * S[:rank]) @ Vh[:rank]
 
+        if 1:
 
-        _, s = _update_affine_ortho_lstsq(x, y, lam, M)
-        #s = _update_projective_shift_only(tracks,lam,M)
-        #_, s = _update_affine_ortho(x, y, lam, M)
+            _, o = _update_affine_ortho_lstsq(x, y, lam, M)
+            #s = _update_projective_shift_only(tracks,lam,M)
+            #_, s = _update_affine_ortho(x, y, lam, M)
 
-        # normalize d and s to avoid numerical issues, 
-        #d = d / torch.norm(d)
-        d = torch.ones_like(d)
-        s = s - s[0]
-        #s = torch.abs(s)
+            # normalize d and s to avoid numerical issues, 
+            #d = d / torch.norm(d)
+            s = torch.ones_like(s)
+            o = o - o[0]
+            #s = torch.abs(s)
 
-        scales.append(d.clone())
-        offsets.append(s.clone())
+            scales.append(s.clone())
+            offsets.append(o.clone())
+        else:
+            R = W - M                                                  # (3F, P) residual
+
+            Tf  = tracks.reshape(F, 3, P)                              # (F, 3, P)
+            Rf  = R.reshape(F, 3, P)                                   # (F, 3, P)
+
+            grad = (Tf * Rf).sum(dim=(1, 2))                           # (F,) exact gradient
+
+            # Hessian diagonal (curvature) for optimal step size:
+            # d²L/d(o_f)² = 2 * ||tracks_f||²
+            hess = (Tf * Tf).sum(dim=(1, 2))                           # (F,)
+
+            # Newton step — exact for quadratic, good approximation here
+            o_new = offsets[-1] - grad / (hess + 1e-8)
+            o_new = o_new - o_new[0]
+
+            scales.append(torch.ones_like(o_new))
+            offsets.append(o_new)
+
 
         Wn = (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
         
         #rho = (torch.norm(Wn - M) / (torch.norm(Wn) + 1e-12)).item()
         rho = (torch.norm(Wn - M)).item()
         if rho < best[0] - tol:
-            best = (rho, d.clone(), s.clone(), M.clone())
+            best = (rho, s.clone(), o.clone(), M.clone())
         else:
             if iter > 10000:
                 print(rho)
                 break
 
-    _, d, s, M = best
+    _, s, o, M = best
     W = (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
     scales = torch.stack(scales)
     offsets = torch.stack(offsets)

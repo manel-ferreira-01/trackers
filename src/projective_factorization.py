@@ -365,6 +365,105 @@ def projective_factorization(obs_mat_scaled):
 
     return M , S, T_vec, torch.stack(scales) #/ torch.sqrt(alphas_sq)
 
+def projective_factorization_fast(obs_mat_scaled):
+    device = obs_mat_scaled.device
+    dtype = obs_mat_scaled.dtype
+    F = obs_mat_scaled.shape[0] // 3
+
+    # 1. Center
+    T_vec = obs_mat_scaled.mean(dim=1, keepdim=True)
+    W_centered = obs_mat_scaled - T_vec
+
+    # 2. SVD rank-3
+    U, S_vals, Vh = torch.linalg.svd(W_centered, full_matrices=False)
+    S_root = torch.sqrt(S_vals[:3])
+    M_hat = (U[:, :3] * S_root).contiguous()    # line ~26
+    S_hat = (S_root[:, None] * Vh[:3]).contiguous()
+
+    # 3. Metric constraints — fully vectorized, no loop
+    # Reshape M_hat into (F, 3, 3): rows are [mx, my, mz] per frame
+    Mf = M_hat.reshape(F, 3, 3)           # (F, 3, 3)
+
+    # Build all outer products at once: (F, 3, 3, 3) -> constraint vectors (F, 3, 3, 6)
+    # For each pair (i,j), constraint vector c_ij has 6 entries for symmetric Q
+    # c = [m[a]*m[b]] mapped to upper-tri indices
+    # Indices for symmetric 3x3: (0,0),(0,1),(0,2),(1,1),(1,2),(2,2)
+    i_idx = torch.tensor([0, 0, 0, 1, 1, 2], device=device)
+    j_idx = torch.tensor([0, 1, 2, 1, 2, 2], device=device)
+
+    # m_i, m_j: (F, 3, 3) -> pick components
+    mi = Mf[:, :, i_idx]   # (F, 3, 6)  — axis1=which row (mx/my/mz), axis2=component index
+    mj = Mf[:, :, j_idx]   # (F, 3, 6)
+
+    # Symmetry factor: off-diagonal gets factor 2 (m[a]*m[b] + m[b]*m[a])
+    sym_factor = torch.where(i_idx == j_idx,
+                             torch.ones(6, device=device, dtype=dtype),
+                             2 * torch.ones(6, device=device, dtype=dtype))
+
+    # A_constraints: (F, 9, 6) — 9 constraints per frame (3 norm + 6 ortho... actually 3+3+3=9)
+    # Each row pair (row_a, row_b): sum over components with sym_factor
+    A_block = (mi * mj * sym_factor).sum(dim=0)  # wrong — need per-pair
+
+    # Correct: for each frame, constraint for row pair (a,b) is sum_k m[a,k]*m[b,k] for each Q entry
+    # A[f, constraint_idx, q_idx] = sum_k  mi[f,a,k] * mj[f,b,k]  -- but we want Q contraction
+    # Let's do it directly:
+    # For pair (a,b): c_vec[q] = m_a[i_idx[q]] * m_b[j_idx[q]] * (1 if diag else 1, sum both)
+    # Since Q is symmetric: m^T Q m = sum_{p,q} m[p] Q[p,q] m[q]
+    #                                = sum over upper-tri: q_vec[k] * (m[i_k]*m[j_k] * sym[k])
+
+    pairs = [(0,0,1.0),(1,1,1.0),(2,2,1.0),(0,1,0.0),(0,2,0.0),(1,2,0.0)]
+    b_vals = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+
+    # m_a, m_b for all pairs at once: pair_a/b indices
+    pa = torch.tensor([p[0] for p in pairs], device=device)
+    pb = torch.tensor([p[1] for p in pairs], device=device)
+    b_vec = torch.tensor(b_vals, device=device, dtype=dtype)
+
+    ma_all = Mf[:, pa, :]   # (F, 6, 3)
+    mb_all = Mf[:, pb, :]   # (F, 6, 3)
+
+    # A_block[f, constraint, q_entry] = ma[f,c,i_idx[q]] * mb[f,c,j_idx[q]] * sym[q]
+    A_constraints = (ma_all[:, :, i_idx] * mb_all[:, :, j_idx]) * sym_factor  # (F, 6, 6)
+    A_constraints = A_constraints.view(F * 6, 6)
+
+    b_full = b_vec.unsqueeze(0).expand(F, -1).reshape(F * 6, 1)
+
+    # Append homogeneous column and solve null space
+    A_aug = torch.cat([A_constraints, -b_full], dim=1)   # (6F, 7)
+
+    _, _, Vh_full = torch.linalg.svd(A_aug)
+    l = Vh_full[-1]
+    l = l / l[6]
+    q_vec = l[:6]
+
+    Q = torch.zeros(3, 3, device=device, dtype=dtype)
+    Q[i_idx, j_idx] = q_vec
+    Q[j_idx, i_idx] = q_vec   # symmetrize
+
+    # 4. Factor Q -> L
+    Uq, Sq, _ = torch.linalg.svd(Q)
+    Sq = torch.clamp(Sq, min=1e-9)
+    L = Uq @ torch.diag(torch.sqrt(Sq))
+
+    M = M_hat @ L
+    S = torch.linalg.solve(L, S_hat)   # faster than inv @ S_hat
+
+    # 5. Batched Procrustes — no loop
+    Mf2 = M.reshape(F, 3, 3)                             # (F, 3, 3)
+    Up, Sp, Vhp = torch.linalg.svd(Mf2)               # all F at once
+    R_batch = Up @ Vhp                                 # (F, 3, 3)
+
+    # Fix det < 0
+    dets = torch.linalg.det(R_batch)                   # (F,)
+    flip = torch.ones(F, 1, 1, device=device, dtype=dtype)
+    flip[dets < 0] = -1.0
+    #R_batch = R_batch * flip
+
+    M = R_batch.reshape(3 * F, 3)
+    scales = Sp.mean(dim=1)                            # (F,)
+
+    return M, S, T_vec, scales
+
 import torch
 import numpy as np
 import torch
@@ -426,7 +525,7 @@ def get_subspace_outlier_indices(W, rank=4, threshold=100.0, use_relative=False,
         
         p_null = torch.eye(D, device=device) - Ub_final @ Ub_final.T
         residuals = torch.norm(p_null @ W, dim=0)**2
-        print(f"RANSAC finished {iterations} iterations. Inliers found: {best_inlier_count}")
+        #print(f"RANSAC finished {iterations} iterations. Inliers found: {best_inlier_count}")
 
     # --- Thresholding Logic ---
     if use_relative:
@@ -451,3 +550,58 @@ def get_subspace_outlier_indices(W, rank=4, threshold=100.0, use_relative=False,
         print(f"Number of outliers detected: {outlier_mask.sum().item()}")
         
     return new_W, outlier_mask, residuals
+
+def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
+    
+    def to_4x4(m):
+        if isinstance(m, torch.Tensor):
+            m = m.detach().cpu().numpy()
+        return np.vstack([m, [0, 0, 0, 1]])
+
+    def normalize(traj):
+        m4x4 = [to_4x4(m) for m in traj]
+        m0_inv = np.linalg.inv(m4x4[0])
+        return [m @ m0_inv for m in m4x4]
+
+    rel_alg = normalize(cam_lists)
+    rel_gt  = normalize(gt_lists)
+
+    rot_errors  = []
+    dir_errors  = []
+    norms_alg   = []  # ← collect here
+    norms_gt    = []  # ← collect here
+
+    for i in range(1, len(rel_alg)):
+        # --- Rotation Error ---
+        R_alg = rel_alg[i][:3, :3]
+        R_gt  = rel_gt[i][:3, :3]
+        R_diff    = R_alg @ R_gt.T
+        trace_val = (np.trace(R_diff) - 1) / 2.0
+        rot_err   = np.degrees(np.arccos(np.clip(trace_val, -1.0, 1.0)))
+        rot_errors.append(rot_err)
+
+        # --- Translation ---
+        t_alg    = rel_alg[i][:3, 3]
+        t_gt     = rel_gt[i][:3, 3]
+        norm_alg = np.linalg.norm(t_alg)
+        norm_gt  = np.linalg.norm(t_gt)
+
+        norms_alg.append(norm_alg)  # ← save
+        norms_gt.append(norm_gt)    # ← save
+
+        if norm_alg < min_t_mag or norm_gt < min_t_mag:
+            dir_errors.append(np.nan)   # exclude near-zero baselines
+        else:
+            unit_alg = t_alg / norm_alg
+            unit_gt  = t_gt  / norm_gt
+            dot      = np.dot(unit_alg, unit_gt)
+            dir_errors.append(np.degrees(np.arccos(np.clip(dot, -1.0, 1.0))))
+
+    return {
+        "mean_rot":  np.mean(rot_errors),
+        "mean_dir":  np.nanmean(dir_errors),
+        "rot_list":  rot_errors,
+        "dir_list":  dir_errors,
+        "norm_alg":  norms_alg,   # (F-1,) one per relative frame
+        "norm_gt":   norms_gt,
+    }

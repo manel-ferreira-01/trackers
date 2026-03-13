@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.optimize import least_squares
 import cv2
+import torch 
 
 # ─── Projection & Residuals ───────────────────────────────────────────────────
 
@@ -79,7 +80,7 @@ def run_bundle_adjustment(rotations, translations, points_3d, points_2d, K):
         x0,
         method='trf',
         args=(points_2d, K, n_cameras, n_points),
-        verbose=2
+        verbose=2,
     )
 
     refined_cameras = result.x[:n_cameras * 6].reshape(n_cameras, 6)
@@ -92,3 +93,24 @@ def run_bundle_adjustment(rotations, translations, points_3d, points_2d, K):
     print(f"\nFinal cost: {result.cost:.4f}")
 
     return refined_rvecs, refined_tvecs, refined_points, result
+
+
+def make_cam_lists(rvecs, tvecs):
+    """
+    rvecs:  (F, 3) numpy - Rodrigues vectors
+    tvecs:  (F, 3) numpy - translation vectors
+    returns: list of (4, 4) torch tensors, same format as input cam_lists
+    """
+    import torch
+    cam_lists_refined = []
+    for rvec, tvec in zip(rvecs, tvecs):
+        R, _ = cv2.Rodrigues(rvec)
+        
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3,  3] = tvec
+        
+        cam_lists_refined.append(torch.tensor(T[:3,:], dtype=torch.float64))
+    
+    return cam_lists_refined
+
