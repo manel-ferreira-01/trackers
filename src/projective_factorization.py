@@ -457,7 +457,7 @@ def projective_factorization_fast(obs_mat_scaled):
     dets = torch.linalg.det(R_batch)                   # (F,)
     flip = torch.ones(F, 1, 1, device=device, dtype=dtype)
     flip[dets < 0] = -1.0
-    #R_batch = R_batch * flip
+    R_batch = R_batch * flip
 
     M = R_batch.reshape(3 * F, 3)
     scales = Sp.mean(dim=1)                            # (F,)
@@ -470,7 +470,7 @@ import torch
 import matplotlib.pyplot as plt
 
 def get_subspace_outlier_indices(W, rank=4, threshold=100.0, use_relative=False, 
-                                 mode='svd', iterations=100, viz=True):
+                                 mode='svd', iterations=100,ransac_threshold=1, viz=True):
     """
     Detects column outliers by projecting data onto a subspace.
     
@@ -511,7 +511,7 @@ def get_subspace_outlier_indices(W, rank=4, threshold=100.0, use_relative=False,
             
             # 4. Determine inliers based on current threshold
             # Note: In RANSAC, 'threshold' usually refers to the distance error
-            inlier_mask = res_h < threshold
+            inlier_mask = res_h < ransac_threshold
             num_inliers = inlier_mask.sum()
             
             if num_inliers > best_inlier_count:

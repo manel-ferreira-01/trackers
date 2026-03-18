@@ -287,51 +287,84 @@ def _norm_uv_per_frame(tracks, K):
     return x, y
 
 @torch.no_grad()
-def _update_affine_ortho(x, y, lam, M, eps=1e-6, clamp_pos=True):
+def _update_affine_ortho(x, y, lam, M, mask=None, eps=1e-6, clamp_pos=True):
+    """
+    mask : (F, P) bool, True where observed. If None, all entries used.
+    """
     F, P = lam.shape
     Mx, My = M[0::3], M[1::3]
 
-    X2Y2 = x**2 + y**2              # [F,P]
-    L = lam
+    if mask is None:
+        # infer from NaNs in lam
+        mask = ~torch.isnan(lam)
 
-    a11 = (L*L * X2Y2).sum(1) + eps
-    a22 = (X2Y2).sum(1) + eps
-    a12 = (L * X2Y2).sum(1)
+    m = mask.float()  # (F, P)
 
-    b1 = ((L*x)*Mx + (L*y)*My).sum(1)
-    b2 = (x*Mx + y*My).sum(1)
+    # zero out NaN entries so they don't contribute
+    x_   = torch.nan_to_num(x,   nan=0.0)
+    y_   = torch.nan_to_num(y,   nan=0.0)
+    L    = torch.nan_to_num(lam, nan=0.0)
+    Mx_  = torch.nan_to_num(Mx,  nan=0.0)
+    My_  = torch.nan_to_num(My,  nan=0.0)
+
+    X2Y2 = x_**2 + y_**2            # (F, P)
+
+    a11 = (m * L*L  * X2Y2).sum(1) + eps
+    a22 = (m *        X2Y2).sum(1) + eps
+    a12 = (m * L    * X2Y2).sum(1)
+
+    b1  = (m * (L*x_*Mx_ + L*y_*My_)).sum(1)
+    b2  = (m * (  x_*Mx_ +   y_*My_)).sum(1)
 
     det = a11*a22 - a12*a12 + eps
-    d = (a22*b1 - a12*b2) / det
-    s = (-a12*b1 + a11*b2) / det
+    d   = ( a22*b1 - a12*b2) / det
+    s   = (-a12*b1 + a11*b2) / det
+
     if clamp_pos:
         d = torch.clamp(d, min=1e-5)
+
     return d, s
 
-def _update_affine_ortho_lstsq(x, y, lam, M):
+def _update_affine_ortho_lstsq(x, y, lam, M, mask=None):
     """Vectorized orthographic per-frame least squares — no Python loop."""
     F, P = lam.shape
     Mx, My, Mz = M[0::3], M[1::3], M[2::3]  # [F, P] each
 
+    if mask is None:
+        mask = ~torch.isnan(lam)
+
+    m = mask.float()  # (F, P)
+
+    # zero out NaN entries
+    x_  = torch.nan_to_num(x,   nan=0.0)
+    y_  = torch.nan_to_num(y,   nan=0.0)
+    L   = torch.nan_to_num(lam, nan=0.0)
+    Mx_ = torch.nan_to_num(Mx,  nan=0.0)
+    My_ = torch.nan_to_num(My,  nan=0.0)
+    Mz_ = torch.nan_to_num(Mz,  nan=0.0)
+
+    # Apply mask by zeroing out missing entries
+    x_  = m * x_
+    y_  = m * y_
+    L   = m * L
+    Mx_ = m * Mx_
+    My_ = m * My_
+    Mz_ = m * Mz_
+
     # Build design matrix A: [F, 3P, 2]
-    col1 = torch.cat([x * lam, y * lam, lam], dim=1)          # [F, 3P]
-    col2 = torch.cat([x,       y,        torch.ones_like(x)], dim=1)  # [F, 3P]
-    A = torch.stack([col1, col2], dim=2)                        # [F, 3P, 2]
+    col1 = torch.cat([x_ * L, y_ * L, L],          dim=1)  # [F, 3P]
+    col2 = torch.cat([x_,     y_,     m],           dim=1)  # [F, 3P] — m not ones, zeros where missing
+    A = torch.stack([col1, col2], dim=2)                     # [F, 3P, 2]
 
     # Build target B: [F, 3P, 1]
-    B = torch.cat([Mx, My, Mz], dim=1).unsqueeze(-1)           # [F, 3P, 1]
+    B = torch.cat([Mx_, My_, Mz_], dim=1).unsqueeze(-1)     # [F, 3P, 1]
 
-    # Batched least squares: solve all F frames simultaneously
-    # lstsq expects [..., m, n] for A and [..., m, k] for B
-    theta, *_ = torch.linalg.lstsq(A, B)                       # [F, 2, 1]
-    theta = theta.squeeze(-1)                                   # [F, 2]
-    s   = theta[:, 0]        # scale
-    so  = theta[:, 1]        # this is s*o, NOT o
-    o   = so / (s + 1e-8)   # recover true offset
-    #print("s:", s)
-    #print("so:", so)
-    #print("o:", o)
+    theta, *_ = torch.linalg.lstsq(A, B)                    # [F, 2, 1]
+    theta = theta.squeeze(-1)                                # [F, 2]
 
+    s  = theta[:, 0]
+    so = theta[:, 1]
+    o  = so / (s + 1e-8)
 
     return s, o
 
@@ -370,22 +403,27 @@ def calibrate_orthographic(tracks, lam, K, rank=4, iters=10, tol=1e-5, ridge=1e-
         W= (lam.repeat_interleave(3, dim=0) + offsets[-1][:,None].repeat_interleave(3,0) @ torch.ones(1, P)) * scales[-1][:,None].repeat_interleave(3,0) * tracks
         
         if 0:
-            motion, shape, tvec, _ = projective_factorization(Wn)
-            Wn = torch.cat((motion, tvec), dim=1) @ torch.cat((shape, torch.ones(1, P)), dim=0)
+            motion, shape, tvec, _ = projective_factorization(W)
+            M = torch.cat((motion, tvec), dim=1) @ torch.cat((shape, torch.ones(1, P)), dim=0)
+            m = M + tvec[:, None] @ torch.ones(1, P)
         else:
             U, S, Vh = torch.linalg.svd(W, full_matrices=False)
             M = (U[:, :rank] * S[:rank]) @ Vh[:rank]
 
         if 1:
 
-            _, o = _update_affine_ortho_lstsq(x, y, lam, M)
+            #_, o = _update_affine_ortho_lstsq(x, y, lam, M)
             #s = _update_projective_shift_only(tracks,lam,M)
-            #_, s = _update_affine_ortho(x, y, lam, M)
+            _, o = _update_affine_ortho(x, y, lam, M)
 
             # normalize d and s to avoid numerical issues, 
             #d = d / torch.norm(d)
             s = torch.ones_like(s)
-            o = o - o[0]
+            o = o - o[0]  # fix gauge freedom by anchoring first frame's offset to zero
+            #lam_shifted = lam + o[:, None]          # (F, P)
+            #mean_depth   = lam_shifted.mean()        # global mean
+            #o = o - (mean_depth - lam.mean())        # keep mean depth constant across iters
+
             #s = torch.abs(s)
 
             scales.append(s.clone())

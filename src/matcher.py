@@ -63,7 +63,7 @@ def build_anchor_observation_matrix(video_tensor, device='cuda'):
 
     return W
 
-def build_combinatory_observation_matrix(video_tensor, extractor, matcher, device='cuda'):
+def build_combinatory_observation_matrix(video_tensor, device='cuda'):
     """
     Builds a sparse observation matrix by sequentially matching frames.
     Features that drop out or appear later are filled with NaNs.
@@ -72,6 +72,7 @@ def build_combinatory_observation_matrix(video_tensor, extractor, matcher, devic
         W: (2 * num_frames, num_unique_tracks) Interleaved [x0, y0, x1, y1...] with NaNs.
     """
     num_frames = video_tensor.shape[0]
+    extractor, matcher = _get_matcher(device)
     
     # 1. Pre-extract all features
     all_feats = []

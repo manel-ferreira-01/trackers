@@ -64,7 +64,7 @@ def run_reconstruction(
         off_map = total_offsets.unsqueeze(1).repeat_interleave(3, 0).expand(-1, N)
         scl_map = current_scales.unsqueeze(1).repeat_interleave(3, 0).expand(-1, N)
         current_Lambda = (Lambda + off_map) / scl_map
-
+        
         # A. Orthographic Calibration
         _, delta_snapshots, _, _ = calibrate_orthographic(
             W_mat,
@@ -152,7 +152,7 @@ def run_reconstruction(
         plt.xlabel("Total Calibration Steps")
         plt.ylabel("Total Offset Value")
         plt.grid(True, alpha=0.3)
-        plt.legend()
+        #plt.legend()
         plt.tight_layout()
         plt.show()
 
