@@ -169,243 +169,203 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
         ridge  : ALS regularization
 
     Returns:
-        d, o   : (F,) scale and offset per frame
-        W      : (3F, P) completed + calibrated matrix
-        M      : (3F, P) rank-4 approximation
+        o       : (F,)      offset per frame
+        W_final : (3F, P)   completed matrix (removed rows/cols filled with NaN)
+        M_full  : (3F, P)   rank-4 approximation (removed rows/cols filled with NaN)
+        mask_out: (3F, P)   final observation mask
     """
-    F, P   = lam.shape
-    device = lam.device
-    dtype  = lam.dtype
+    F_orig, P_orig = lam.shape
+    device         = lam.device
+    dtype          = lam.dtype
 
-    x = tracks[0::3]   # (F, P)
-    y = tracks[1::3]   # (F, P)
+    # Active index trackers (boolean over originals)
+    active_cols   = torch.ones(P_orig,      dtype=torch.bool, device=device)
+    active_frames = torch.ones(F_orig,      dtype=torch.bool, device=device)
+    active_rows   = torch.ones(3 * F_orig,  dtype=torch.bool, device=device)  # derived
 
-    # --- Initialize d, o ---
-    d = torch.ones(F,  device=device, dtype=dtype)
-    o = torch.zeros(F, device=device, dtype=dtype)
+    # Working views — will be re-sliced in place
+    lam_w    = lam.clone()
+    tracks_w = tracks.clone()
+    mask_w   = mask.clone()
+
+    d = torch.ones(F_orig,  device=device, dtype=dtype)
+    o = torch.zeros(F_orig, device=device, dtype=dtype)
 
     offset_history = []
-    scales_history = []
+    eye_r          = ridge * torch.eye(rank, device=device, dtype=dtype)
 
-    mask_3F  = mask                                          # (3F, P) bool
-    mask_f   = mask_3F.float()                               # (3F, P) float
-    eye_r    = ridge * torch.eye(rank, device=device, dtype=dtype)
-
-    # --- Initialize U, V from mean-imputed matrix ---
-    lam3     = lam.repeat_interleave(3, dim=0)               # (3F, P)
-    W_init   = lam3 * tracks
+    # --- SVD initialisation ---
+    lam3_w   = lam_w.repeat_interleave(3, dim=0)
+    W_init   = lam3_w * tracks_w
     col_mean = torch.nanmean(W_init, dim=0)
-    #W_filled = torch.where(mask_3F, W_init, col_mean.unsqueeze(0).expand_as(W_init))
-    W_filled = torch.where(mask_3F, W_init, torch.zeros_like(W_init)) # start with zeros for missing
+    W_filled = torch.where(mask_w, W_init,
+                           col_mean.unsqueeze(0).expand_as(W_init))
 
     Ui, Si, Vhi = torch.linalg.svd(W_filled, full_matrices=False)
-    U = (Ui[:, :rank] * Si[:rank].sqrt()).contiguous()       # (3F, rank)
-    V = (Vhi[:rank].T * Si[:rank].sqrt()).contiguous()       # (P,  rank)
-    M = U @ V.T                                              # (3F, P)
-
-    best     = (float('inf'), d.clone(), o.clone(), M.clone())
-
-    for it in range(iters):
-
-        # ---- 1. Build calibrated W (observed entries only) ----
-        d3       = d.repeat_interleave(3)                    # (3F,)
-        o3       = o.repeat_interleave(3)                    # (3F,)
-        W_scaled = (d3[:, None] * lam3 + o3[:, None]) * tracks   # (3F, P), NaN where missing
-
-        # Fill missing with current low-rank prediction
-        W_filled = torch.where(mask_3F, W_scaled, torch.zeros_like(W_scaled))        # (3F, P)
-
-        # ---- 2. ALS completion: one pass ----
-        # Update U
-        A_U = torch.einsum('ij,jk,jl->ikl', mask_f, V, V) + eye_r   # (3F, rank, rank)
-        b_U = (mask_f * W_filled) @ V                                 # (3F, rank)
-        U   = torch.linalg.solve(A_U, b_U.unsqueeze(-1)).squeeze(-1) # (3F, rank)
-
-        # Update V
-        A_V = torch.einsum('ij,ik,il->jkl', mask_f, U, U) + eye_r   # (P, rank, rank)
-        b_V = (mask_f * W_filled).T @ U                               # (P, rank)
-        V   = torch.linalg.solve(A_V, b_V.unsqueeze(-1)).squeeze(-1) # (P, rank)
-
-        M   = U @ V.T                                        # (3F, P)
-        
-        #W_filled = torch.nan_to_num(W_scaled, nan=30.0)
-        #U, S, Vh = torch.linalg.svd(W_filled, full_matrices=False)
-        #M = (U[:, :rank] * S[:rank]) @ Vh[:rank]
-        
-        # ---- 3. Offset + scale solve against M ----
-        # TODO:CHECK THIS
-        d, o = _update_affine_ortho(x, y, lam, M, mask=mask_3F[0::3])
-        #d, o = _update_affine_ortho_lstsq(x,y, lam, M, mask=mask_3F[0::3])
-        #print("d",d)
-        o = o-o[0]                                      # zero-mean offset
-        offset_history.append(o.clone())
-        d    = torch.ones_like(d)                            # scale absorbed into shape
-
-        # ---- 4. Convergence ----
-        d3       = d.repeat_interleave(3)
-        o3       = o.repeat_interleave(3)
-        W_scaled = d3[:, None] *  (lam3 + o3[:, None]) * tracks
-
-        if 0:
-            W_filled = torch.where(mask_3F, W_scaled, torch.zeros_like(W_scaled))        # (3F, P)
-            motion, shape, tvec, scales = projective_factorization_fast(W_filled)
-            d = scales
-            d3 = d.repeat_interleave(3)
-            W_scaled = (d3[:, None] * lam3 + o3[:, None])
-            print("scales",scales)
-        
-        # Only measure residual on observed entries
-        diff = (W_scaled - M)
-        rho = diff[mask_3F].norm().item()
-
-
-        best = (rho, d.clone(), o.clone(), M.clone())
-        if rho < best[0] - tol:
-            pass
-
-    _, d, o, M = best
-
-    # Final completed matrix
-    d3       = d.repeat_interleave(3)
-    o3       = o.repeat_interleave(3)
-    W_final  = (d3[:, None] * lam3 + o3[:, None]) * tracks
-    W_final  = torch.where(mask_3F, W_final, M)             # fill missing with rank-4
-
-    if 1:
-        motion, shape, tvec, scales = projective_factorization_fast(W_final)
-        scales = scales / scales.max()
-        d = scales
-        d3 = d.repeat_interleave(3)
-        W_final = (d3[:, None] * lam3 + o3[:, None]) * tracks
-        W_final  = torch.where(mask_3F, W_final, M)             # fill missing with rank-4
-
-
-
-    # Plot offset history at the end
-    import matplotlib.pyplot as plt
-    history_tensor = torch.stack(offset_history).cpu().numpy()  # (iters, F)
-    plt.figure(figsize=(10, 4))
-    for f in range(F):
-        plt.plot(history_tensor[:, f], label=f"Frame {f}")
-    plt.title("Offset evolution per frame")
-    plt.xlabel("Iteration")
-    plt.ylabel("Offset value")
-    #plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
-
-    # Plot scales history at the end
-    #scales_tensor = torch.stack(scales_history).cpu().numpy()  # (iters, F)
-    #plt.figure(figsize=(10, 4))
-    #for f in range(F):
-    #    plt.plot(scales_tensor[:, f], label=f"Frame {f}")
-    #plt.title("Scale evolution per frame")
-    #plt.xlabel("Iteration")
-    #plt.ylabel("Scale value")
-    #plt.legend()
-    #plt.grid(True, alpha=0.3)
-    #plt.show()
-
-    return o, W_final, M
-
-
-def calibrate_with_completion_claude(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ridge=1e-3):
-    F, P   = lam.shape
-    device = lam.device
-    dtype  = lam.dtype
-
-    x = tracks[0::3]
-    y = tracks[1::3]
-
-    mask_F  = mask[0::3]          # (F, P) — per point mask
-    mask_f  = mask.float()        # (3F, P)
-
-    # impute lam nans with per-frame mean
-    lam_filled = lam.clone()
-    lam_filled[torch.isnan(lam)] = torch.nanmean(lam)
-
-    o  = torch.zeros(F, device=device, dtype=dtype)
-    
-    # Initialize tracks_filled — fill missing with column mean
-    tracks_filled = tracks.clone()
-    col_means = torch.nanmean(tracks, dim=0)
-    tracks_filled[torch.isnan(tracks)] = col_means.expand_as(tracks)[torch.isnan(tracks)]
-
-    # Initialize UV from first scaled matrix
-    Z = (lam_filled + o[:, None]).repeat_interleave(3, dim=0) * tracks_filled
-    print(torch.isnan(Z).any().sum())
-    Ui, Si, Vhi = torch.linalg.svd(Z, full_matrices=False)
-    U = (Ui[:, :rank] * Si[:rank].sqrt()).contiguous()
-    V = (Vhi[:rank].T * Si[:rank].sqrt()).contiguous()
+    U = (Ui[:, :rank] * Si[:rank].sqrt()).contiguous()   # (3F, rank)
+    V = (Vhi[:rank].T * Si[:rank].sqrt()).contiguous()   # (P,  rank)
     M = U @ V.T
 
-    eye_r  = ridge * torch.eye(rank, device=device, dtype=dtype)
-    best   = (float('inf'), o.clone(), M.clone())
-    offset_history = []
+    best = (float('inf'), d.clone(), o.clone(), M.clone(),
+            active_cols.clone(), active_frames.clone())
 
     for it in range(iters):
+        F_w = lam_w.shape[0]
+        P_w = lam_w.shape[1]
 
-        # ---- 1. Update tracks_filled: fill missing W entries from M and current o ----
-        # M_fp = (lam_fp + o_f) * W_fp  =>  W_fp = M_fp / (lam_fp + o_f)
-        denom        = (lam_filled + o[:, None]).repeat_interleave(3, dim=0)  # (3F, P)
-        W_from_M     = M / denom.clamp(min=1e-8)                              # (3F, P)
-        tracks_filled = torch.where(mask, tracks, W_from_M)                   # fill missing
+        lam3_w   = lam_w.repeat_interleave(3, dim=0)
+        d3       = d.repeat_interleave(3)
+        o3       = o.repeat_interleave(3)
+        W_scaled = (d3[:, None] * lam3_w + o3[:, None]) * tracks_w
+        W_filled = torch.where(mask_w, W_scaled, torch.zeros_like(W_scaled))
 
-        # ---- 2. Build scaled matrix ----
-        Z        = (lam_filled + o[:, None]).repeat_interleave(3, dim=0) * tracks_filled
-        Z_obs    = torch.where(mask, Z, M)                                    # observed=data, missing=M
+        # ---- Outlier removal after warm-up ----
+        if it > 4:
+            cell_res    = (W_filled - M) ** 2
+            cell_res_fp = cell_res.reshape(F_w, 3, P_w).max(dim=1).values  # (F_w, P_w)
 
-        # ---- 3. ALS completion on Z (one pass) ----
+            threshold   = torch.quantile(cell_res_fp, 0.9)
+            #threshold = 10000
+            bad_fp      = cell_res_fp > threshold                           # (F_w, P_w)
+
+            # --- Columns: bad in too many frames ---
+            bad_col_count = bad_fp.sum(dim=0)                               # (P_w,)
+            remove_cols   = bad_col_count > (F_w - (rank + 4))
+            keep_cols     = ~remove_cols
+
+            # --- Rows: bad in too many points ---
+            bad_row_count = bad_fp.sum(dim=1)                               # (F_w,)
+            remove_frames = bad_row_count > (P_w - (rank + 4))
+            keep_frames   = ~remove_frames
+
+            # Per-entry masking for the rest
+            mask_w = mask_w & ~bad_fp.repeat_interleave(3, dim=0)
+
+            # Under-observed points
+            obs_per_point = mask_w[0::3].sum(dim=0)
+            keep_cols     = keep_cols & (obs_per_point >= rank)
+
+            # Under-observed frames
+            obs_per_frame = mask_w[0::3].sum(dim=1)
+            keep_frames   = keep_frames & (obs_per_frame >= rank)
+
+            n_rem_cols   = (~keep_cols).sum().item()
+            n_rem_frames = (~keep_frames).sum().item()
+
+            if n_rem_cols > 0 or n_rem_frames > 0:
+                print(f"iter {it:3d} | removing {n_rem_cols} cols, "
+                      f"{n_rem_frames} frames "
+                      f"→ ({keep_frames.sum().item()} frames, "
+                      f"{keep_cols.sum().item()} points remaining)")
+
+                # Expand frame keep mask to 3-row blocks
+                keep_rows = keep_frames.repeat_interleave(3)
+
+                # Slice everything consistently
+                lam_w    = lam_w[keep_frames][:, keep_cols]
+                tracks_w = tracks_w[keep_rows][:, keep_cols]
+                mask_w   = mask_w[keep_rows][:, keep_cols]
+                W_filled = W_filled[keep_rows][:, keep_cols]
+                U        = U[keep_rows]                      # (3F_new, rank)
+                V        = V[keep_cols]                      # (P_new,  rank)
+                M        = M[keep_rows][:, keep_cols]
+
+                # Update global trackers
+                active_cols[active_cols.clone()]     = keep_cols
+                active_frames[active_frames.clone()] = keep_frames
+                active_rows = active_frames.repeat_interleave(3)
+
+                # Trim d, o to surviving frames
+                d = d[keep_frames]
+                o = o[keep_frames]
+
+        mask_f = mask_w.float()
+        F_w    = lam_w.shape[0]
+        P_w    = lam_w.shape[1]
+
+        # ---- ALS: update U ----
         A_U = torch.einsum('ij,jk,jl->ikl', mask_f, V, V) + eye_r
-        b_U = (mask_f * Z_obs) @ V
+        b_U = (mask_f * W_filled) @ V
         U   = torch.linalg.solve(A_U, b_U.unsqueeze(-1)).squeeze(-1)
 
+        # ---- ALS: update V ----
         A_V = torch.einsum('ij,ik,il->jkl', mask_f, U, U) + eye_r
-        b_V = (mask_f * Z_obs).T @ U
+        b_V = (mask_f * W_filled).T @ U
         V   = torch.linalg.solve(A_V, b_V.unsqueeze(-1)).squeeze(-1)
 
-        M   = U @ V.T                                                         # (3F, P)
+        M = U @ V.T
 
-        # Use corrected M for offset solve
-        _, o = _update_affine_ortho(x, y, lam_filled, M, mask=mask_F)
-        #o = o - o[0]
+        # ---- Affine calibration ----
+        d, o = _update_affine_ortho(
+            tracks_w[0::3], tracks_w[1::3], lam_w, M, mask=mask_w[0::3]
+        )
+        o = o - o[0]
+        d = torch.ones_like(d)
         offset_history.append(o.clone())
 
-        # ---- 4.5 Update missing lam entries from M ----
-        lam_from_M   = M[2::3]                                    # (F, P) = lam + o
-        lam_updated  = torch.where(mask_F, lam_filled, lam_from_M - o[:, None])
+        # ---- Convergence ----
+        lam3_w   = lam_w.repeat_interleave(3, dim=0)
+        d3       = d.repeat_interleave(3)
+        o3       = o.repeat_interleave(3)
+        W_scaled = d3[:, None] * (lam3_w + o3[:, None]) * tracks_w
+        rho      = (W_scaled - M)[mask_w].norm().item()
 
-        # Then use lam_updated instead of lam_filled for next iteration
-        #lam_filled = lam_updated
+        if rho < best[0] - tol:
+            best = (rho, d.clone(), o.clone(), M.clone(),
+                    active_cols.clone(), active_frames.clone())
 
-        # ---- 5. Convergence on observed entries ----
-        Z_scaled = (lam_filled + o[:, None]).repeat_interleave(3, dim=0) * tracks_filled
-        rho      = (Z_scaled - M)[mask].norm().item()
+    _, d, o, M_best, best_cols, best_frames = best
+    best_rows = best_frames.repeat_interleave(3)
 
-        #if rho < best[0]:
-        best = (rho, o.clone(), M.clone())
+    # ---- Scatter back into full-size tensors ----
+    W_final  = torch.full((3 * F_orig, P_orig), float('nan'), device=device, dtype=dtype)
+    M_full   = torch.full((3 * F_orig, P_orig), float('nan'), device=device, dtype=dtype)
+    mask_out = torch.zeros(3 * F_orig, P_orig,  dtype=torch.bool, device=device)
+    o_full   = torch.zeros(F_orig,              device=device, dtype=dtype)
 
-    _, o, M = best
+    # Final W for surviving entries
+    lam3_w   = lam_w.repeat_interleave(3, dim=0)
+    d3       = d.repeat_interleave(3)
+    o3       = o.repeat_interleave(3)
+    W_obs    = (d3[:, None] * lam3_w + o3[:, None]) * tracks_w
+    W_comp   = torch.where(mask_w, W_obs, M_best)
 
-    # Final: fill missing tracks from M
-    denom         = (lam_filled + o[:, None]).repeat_interleave(3, dim=0)
-    W_from_M      = M / denom.clamp(min=1e-8)
-    tracks_final  = torch.where(mask, tracks, W_from_M)
-    tracks_final[torch.isnan(tracks_final)] = 0.0
+    rows = best_rows.nonzero(as_tuple=True)[0]   # integer indices for scatter
+    cols = best_cols.nonzero(as_tuple=True)[0]
 
-    # Plot
+    W_final[rows[:, None], cols[None, :]]  = W_comp
+    M_full[rows[:, None],  cols[None, :]]  = M_best
+    mask_out[rows[:, None], cols[None, :]] = mask_w
+
+    o_full[best_frames] = o
+
+    # ---- Diagnostics ----
     import matplotlib.pyplot as plt
-    history = torch.stack(offset_history).cpu().numpy()
-    plt.figure(figsize=(10, 4))
-    for f in range(F):
-        plt.plot(history[:, f], label=f"Frame {f}")
-    plt.title("Offset evolution")
-    plt.xlabel("Iteration")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
+
+    if offset_history:
+        history_tensor = torch.stack(offset_history)         # (iters, F_surviving)
+        plt.figure(figsize=(10, 4))
+        for f in range(history_tensor.shape[1]):
+            plt.plot(history_tensor[:, f].cpu().numpy(), alpha=0.6)
+        plt.title("Offset evolution per frame")
+        plt.xlabel("Iteration")
+        plt.ylabel("Offset value")
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+    cell_res    = (W_comp - M_best) ** 2
+    cell_res_fp = cell_res.reshape(lam_w.shape[0], 3, lam_w.shape[1]).max(dim=1).values
+    plt.figure(figsize=(14, 5))
+    plt.imshow(cell_res_fp.cpu().numpy(), aspect='auto', cmap='hot_r', interpolation='none')
+    plt.colorbar()
+    plt.title("Per frame-point residual (surviving entries)")
+    plt.xlabel("Point")
+    plt.ylabel("Frame")
     plt.show()
 
-    return o, tracks_final, M
+    return o_full, W_final, M_full, mask_out.float(), active_frames, active_cols
+
+
 
 
 def check_visibility(mask_F, rank=4):
