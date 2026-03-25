@@ -49,27 +49,8 @@ def get_orthogonal_camera_vectors(P):
     return C, right, up, forward
 
 def k3d_3d_plot(point_input, color_input=None, camera_input=None, scale=70):
-    """
-    Visualizes 3D points and cameras using K3D.
-    
-    Args:
-        point_input: 
-            - A single Nx3 array/tensor of points.
-            - OR a list of [N1x3, N2x3, ...] arrays/tensors.
-        color_input: (Optional)
-            - If None: Each set in point_input gets a unique color from a default palette.
-            - If provided: Must match the structure of point_input.
-            - Can be a list of [N1x3, N2x3, ...] RGB values (0-1 float or 0-255 int).
-            - Can be a list of [N1, N2, ...] packed uint32 integers (0xRRGGBB).
-        camera_input: (Optional)
-            - A list of 3x4 or 4x4 camera projection matrices (World-to-Camera or Cam-to-World).
-        scale: 
-            - Float used to determine point and camera size relative to scene extent.
-    """
-    
     plot = k3d.plot(camera_auto_fit=True)
 
-    # Standard colormap for when no color_input is provided
     default_colors = [
         0xff0000, 0x00ff00, 0x0000ff, 0xffff00,
         0x00ffff, 0xff00ff, 0xffa500, 0x800080
@@ -79,10 +60,8 @@ def k3d_3d_plot(point_input, color_input=None, camera_input=None, scale=70):
     # POINTS
     # -------------------------
     if point_input is not None:
-        # Normalize inputs to lists
         if not isinstance(point_input, (list, tuple)):
             point_input = [point_input]
-        
         if color_input is not None and not isinstance(color_input, (list, tuple)):
             color_input = [color_input]
 
@@ -92,119 +71,87 @@ def k3d_3d_plot(point_input, color_input=None, camera_input=None, scale=70):
             p = p.T if p.shape[0] == 3 else p
             pts_list.append(p.astype(np.float32))
 
-        # Calculate scale based on the whole scene
         combined = np.vstack(pts_list)
         mins, maxs = combined.min(axis=0), combined.max(axis=0)
-        global_extent = np.linalg.norm(maxs - mins)
-        if global_extent == 0: global_extent = 1.0
-        psize = float(global_extent / scale)
+        global_extent = float(np.linalg.norm(maxs - mins)) or 1.0
+        psize = global_extent / scale
 
-        # Plot each set
         for i, p in enumerate(pts_list):
-            params = {
-                "point_size": psize,
-                "name": f"Point Set {i}",
-                #"shader": "flat"
-            }
-
+            params = {"point_size": psize, "name": f"Point Set {i}"}
             if color_input is not None and i < len(color_input):
-                # PER-POINT COLOR MODE
                 c = color_input[i]
                 if torch.is_tensor(c): c = c.detach().cpu().numpy()
-                
-                # If colors are [N, 3], pack them into uint32
                 if c.ndim == 2 and c.shape[1] == 3:
                     if c.max() <= 1.1: c = (c * 255)
                     c = c.astype(np.uint32)
                     c = (c[:, 0] << 16) | (c[:, 1] << 8) | c[:, 2]
-                
                 params["colors"] = c.astype(np.uint32)
             else:
-                # DEFAULT COLORMAP MODE
                 params["color"] = default_colors[i % len(default_colors)]
-
             plot += k3d.points(p, **params)
     else:
         global_extent = 1.0
 
     # -------------------------
-    # CAMERAS (HEAVILY OPTIMIZED)
+    # CAMERAS — fully vectorized
     # -------------------------
     if camera_input is not None:
-
         if not isinstance(camera_input, (list, tuple)):
             camera_input = [camera_input]
 
+        N = len(camera_input)
         cam_size = global_extent * 0.12
+        dist = cam_size
+        w, h = cam_size * 0.8, cam_size * 0.6
+        a_len = cam_size * 0.4
 
-        all_verts = []
-        all_inds = []
-        optical_centers = []
+        # Batch-extract all camera vectors: (N, 3) each
+        results = np.array([get_orthogonal_camera_vectors(P) for P in camera_input], dtype=object)
+        C = np.stack(results[:, 0]).astype(np.float32)  # (N, 3)
+        R = np.stack(results[:, 1]).astype(np.float32)
+        U = np.stack(results[:, 2]).astype(np.float32)
+        F = np.stack(results[:, 3]).astype(np.float32)
 
-        offset = 0
+        # Frustum corners: (N, 3) each
+        Fd = F * dist
+        c1 = C + Fd + R*w + U*h
+        c2 = C + Fd - R*w + U*h
+        c3 = C + Fd - R*w - U*h
+        c4 = C + Fd + R*w - U*h
 
-        for P in camera_input:
+        # Tripod endpoints: (N, 3) each
+        Ra = C + R * a_len
+        Ua = C + U * a_len
+        Fa = C + F * a_len
 
-            C, R, U, F = get_orthogonal_camera_vectors(P)
+        # Per-camera vertices: 11 verts — C,c1,c2,c3,c4, C,Ra, C,Ua, C,Fa
+        # Stack into (N, 11, 3), then flatten to (N*11, 3)
+        verts = np.stack([C, c1, c2, c3, c4, C, Ra, C, Ua, C, Fa], axis=1)  # (N, 11, 3)
+        all_verts = verts.reshape(-1, 3)  # (N*11, 3)
 
-            C = C.astype(np.float32)
-            R = R.astype(np.float32)
-            U = U.astype(np.float32)
-            F = F.astype(np.float32)
+        # Index template for one camera (11 verts, 0-indexed)
+        idx_template = np.array([
+            [0,1],[0,2],[0,3],[0,4],   # frustum
+            [1,2],[2,3],[3,4],[4,1],   # frustum rect
+            [5,6],                     # R axis
+            [7,8],                     # U axis
+            [9,10]                     # F axis
+        ], dtype=np.uint32)            # (11, 2)
 
-            dist = cam_size
-            w, h = cam_size * 0.8, cam_size * 0.6
+        # Broadcast offsets: each camera block starts at i*11
+        offsets = (np.arange(N) * 11).reshape(N, 1, 1).astype(np.uint32)  # (N,1,1)
+        all_inds = (idx_template[None] + offsets).reshape(-1, 2)           # (N*11, 2)
 
-            c1 = C + F*dist + R*w + U*h
-            c2 = C + F*dist - R*w + U*h
-            c3 = C + F*dist - R*w - U*h
-            c4 = C + F*dist + R*w - U*h
-
-            verts = np.vstack([C, c1, c2, c3, c4]).astype(np.float32)
-
-            # Frustum lines
-            inds = np.array([
-                [0,1],[0,2],[0,3],[0,4],
-                [1,2],[2,3],[3,4],[4,1]
-            ], dtype=np.uint32)
-
-            # Tripod axes
-            a_len = cam_size * 0.4
-
-            tripod_verts = np.vstack([
-                C, C + R*a_len,
-                C, C + U*a_len,
-                C, C + F*a_len
-            ]).astype(np.float32)
-
-            tripod_inds = np.array([
-                [5,6],
-                [7,8],
-                [9,10]
-            ], dtype=np.uint32)
-
-            # Merge verts
-            merged = np.vstack([verts, tripod_verts])
-
-            all_verts.append(merged)
-            all_inds.append(np.vstack([inds, tripod_inds]) + offset)
-
-            offset += merged.shape[0]
-
-            optical_centers.append(C)
-
-        # SINGLE draw call for ALL cameras
         plot += k3d.lines(
-            np.vstack(all_verts),
-            np.vstack(all_inds),
+            all_verts,
+            all_inds,
             color=0xff0000,
             width=float(cam_size * 0.02),
             shader="simple"
         )
 
-        # ONE object for all optical centers
         plot += k3d.points(
-            np.vstack(optical_centers),
+            C,
             point_size=float(cam_size * 0.12),
             color=0x000000,
             shader="flat"

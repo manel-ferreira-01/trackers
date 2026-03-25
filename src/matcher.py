@@ -63,92 +63,64 @@ def build_anchor_observation_matrix(video_tensor, device='cuda'):
 
     return W
 
-def build_combinatory_observation_matrix(video_tensor, device='cuda'):
-    """
-    Builds a sparse observation matrix by sequentially matching frames.
-    Features that drop out or appear later are filled with NaNs.
-    
-    Returns:
-        W: (2 * num_frames, num_unique_tracks) Interleaved [x0, y0, x1, y1...] with NaNs.
-    """
+def build_combinatory_observation_matrix(video_tensor, device='cuda', window_size=3):
     num_frames = video_tensor.shape[0]
     extractor, matcher = _get_matcher(device)
-    
+
     # 1. Pre-extract all features
     all_feats = []
     for i in tqdm(range(num_frames), desc="Extracting features"):
-        # video_tensor is [-1, 1], LightGlue wants [0, 1]
         img = (video_tensor[i].permute(2, 0, 1).to(device) + 1) / 2
         all_feats.append(extractor.extract(img))
 
-    # 2. Sequential Matching to Build Track Chains
-    tracks = [] # Will hold 1D tensors of length num_frames
-    
-    # Maps a keypoint index in the 'previous' frame to its global track_id
-    prev_kpt_to_track_id = {}
+    # 2. Union-Find for merging tracks
+    # Each node is (frame, kpt_idx). We'll build tracks from connected components.
+    parent = {}  # (frame, kpt_idx) -> (frame, kpt_idx)
 
-    for f in tqdm(range(num_frames - 1), desc="Sequential Matching (Chaining)"):
-        feats_prev = all_feats[f]
-        feats_curr = all_feats[f+1]
-        
-        # Match Frame f -> Frame f+1
-        res = matcher({'image0': feats_prev, 'image1': feats_curr})
-        res = rbd(res)
-        matches = res['matches'] # (K, 2)
-        
-        curr_kpt_to_track_id = {}
-        
-        for m in matches:
-            idx_prev = m[0].item()
-            idx_curr = m[1].item()
-            
-            if idx_prev in prev_kpt_to_track_id:
-                # The point exists in an active track; extend it to the current frame
-                track_id = prev_kpt_to_track_id[idx_prev]
-                tracks[track_id][f+1] = idx_curr
-                curr_kpt_to_track_id[idx_curr] = track_id
-            else:
-                # The point wasn't tracked previously; start a brand new track
-                new_track = torch.full((num_frames,), -1, dtype=torch.long, device=device)
-                new_track[f] = idx_prev
-                new_track[f+1] = idx_curr
-                
-                track_id = len(tracks)
-                tracks.append(new_track)
-                curr_kpt_to_track_id[idx_curr] = track_id
-                
-        # Move forward in time
-        prev_kpt_to_track_id = curr_kpt_to_track_id
+    def find(x):
+        if x not in parent:
+            parent[x] = x
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    if len(tracks) == 0:
-        raise ValueError("No matches found across any frames.")
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
 
-    # Convert tracks list to a 2D tensor of shape (num_frames, num_unique_tracks)
-    tracks_tensor = torch.stack(tracks, dim=0).T 
-    num_unique_tracks = tracks_tensor.shape[1]
+    # 3. Match all pairs within window
+    for f in tqdm(range(num_frames), desc="Multi-pair matching"):
+        for delta in range(1, window_size + 1):
+            g = f + delta
+            if g >= num_frames:
+                break
 
-    print(f"Successfully chained {num_unique_tracks} unique feature tracks.")
+            res = matcher({'image0': all_feats[f], 'image1': all_feats[g]})
+            res = rbd(res)
+            matches = res['matches']  # (K, 2)
 
-    # 3. Construct the Observation Matrix W with NaNs
-    # Initialize entirely with NaNs
-    W = torch.full((2 * num_frames, num_unique_tracks), float('nan'), device=device)
-    
-    for f in range(num_frames):
-        kpts_f = all_feats[f]['keypoints'][0] # (N, 2)
-        
-        # Find which tracks actually have a recorded keypoint in frame f
-        valid_mask = tracks_tensor[f] != -1
-        valid_track_indices = torch.where(valid_mask)[0]
-        
-        if len(valid_track_indices) > 0:
-            kpt_indices = tracks_tensor[f, valid_track_indices]
-            selected_points = kpts_f[kpt_indices] # (V, 2)
-            
-            # Fill X coordinates
-            W[2*f, valid_track_indices] = selected_points[:, 0]
-            # Fill Y coordinates
-            W[2*f + 1, valid_track_indices] = selected_points[:, 1]
+            for m in matches:
+                union((f, m[0].item()), (g, m[1].item()))
 
+    # 4. Group nodes by their root -> these are the tracks
+    groups = {}
+    for node in parent:
+        root = find(node)
+        groups.setdefault(root, []).append(node)
+
+    # 5. Build W
+    num_tracks = len(groups)
+    W = torch.full((2 * num_frames, num_tracks), float('nan'), device=device)
+
+    for track_id, (root, nodes) in enumerate(groups.items()):
+        for (f, kpt_idx) in nodes:
+            kpts = all_feats[f]['keypoints'][0]  # (N, 2)
+            W[2*f,     track_id] = kpts[kpt_idx, 0]
+            W[2*f + 1, track_id] = kpts[kpt_idx, 1]
+
+    print(f"Built {num_tracks} unique tracks from {num_frames} frames (window={window_size}).")
     return W
 
 from src.tapnext_infer import run_tapnext, init_alltracker

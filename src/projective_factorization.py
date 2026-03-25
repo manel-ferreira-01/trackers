@@ -77,6 +77,7 @@ def build_depth_weighted_matrix(tracks, depths: torch.Tensor, Ks):
     x_norm = (u - cx) / fx 
     y_norm = (v - cy) / fy 
 
+
     rays2d = torch.stack([x_norm, y_norm], dim=1)
     rays2d = rays2d.reshape(2 * F, P)
 
@@ -456,7 +457,7 @@ def projective_factorization_fast(obs_mat_scaled):
     # Fix det < 0
     dets = torch.linalg.det(R_batch)                   # (F,)
     flip = torch.ones(F, 1, 1, device=device, dtype=dtype)
-    flip[dets < 0] = -1.0
+    flip[dets < 0] = 1.0
     R_batch = R_batch * flip
 
     M = R_batch.reshape(3 * F, 3)
