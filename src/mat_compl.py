@@ -154,19 +154,24 @@ def incremental_matrix_completion(
     return U @ V.T, torch.tensor(error_list)
 
 
-def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ridge=1e-3):
+def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ridge=1e-3,
+                              offset_mode="normalize", removal_iters=(10, 20, 30, 40)):
     """
     Jointly estimates per-frame affine depth calibration (scale + offset)
     and completes missing entries, such that (d*lam + o) * tracks is rank-4.
 
     Args:
-        tracks : (3F, P) pixel tracks [x,y,1] interleaved, NaN where missing
-        lam    : (F, P)  monocular depths
-        mask   : (3F, P) bool, True where observed
-        rank   : target rank
-        iters  : max iterations
-        tol    : convergence threshold
-        ridge  : ALS regularization
+        tracks      : (3F, P) pixel tracks [x,y,1] interleaved, NaN where missing
+        lam         : (F, P)  monocular depths
+        mask        : (3F, P) bool, True where observed
+        rank        : target rank
+        iters       : max iterations
+        tol         : convergence threshold
+        ridge       : ALS regularization
+        offset_mode : how to handle the per-frame offset after estimation:
+                        "estimate"   – use raw estimated o
+                        "normalize"  – estimate o, then subtract o[0] (default)
+                        "zero"       – always keep o = 0 (no offset)
 
     Returns:
         o       : (F,)      offset per frame
@@ -209,7 +214,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
     best = (float('inf'), d.clone(), o.clone(), M.clone(),
             active_cols.clone(), active_frames.clone(),
             lam_w.clone(), tracks_w.clone(), mask_w.clone())  # snapshot working tensors
-
+    
     for it in range(iters):
         F_w = lam_w.shape[0]
         P_w = lam_w.shape[1]
@@ -222,8 +227,8 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
         W_filled = torch.where(mask_w, W_scaled, M)
         #W_filled = torch.where(mask_w, W_scaled, torch.zeros_like(W_scaled))
 
-        # ---- Outlier removal after warm-up ----
-        if it > 10:
+        # ---- Outlier removal at fixed iterations ----
+        if it in removal_iters:
             res_A = (W_filled - M) ** 2
 
             # --- Option B: project W_filled onto V subspace ---
@@ -240,7 +245,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
             cell_res    = res_A   # <-- swap to res_B or res_C to test
             cell_res_fp = cell_res.reshape(F_w, 3, P_w).max(dim=1).values
 
-            threshold   = torch.quantile(cell_res_fp, 0.997)
+            threshold   = torch.quantile(cell_res_fp, 0.9)
             bad_fp      = cell_res_fp > threshold
             #bad_fp = (cell_res_fp == cell_res_fp.max())
 
@@ -321,8 +326,10 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
             d, o = _update_affine_ortho(
                 tracks_w[0::3], tracks_w[1::3], lam_w, M, mask=mask_w[0::3]
             )
-            o = o - o[0]
-            #o = torch.zeros_like(o)
+            if offset_mode == "normalize":
+                o = o - o[0]
+            elif offset_mode == "zero":
+                o = torch.zeros_like(o)
         else:
             o = torch.zeros_like(o)
         

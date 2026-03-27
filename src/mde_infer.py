@@ -2,6 +2,7 @@ import sys
 import torch
 import numpy as np
 from tqdm import tqdm
+import math
 
 _MODEL_CACHE = globals().get("_MODEL_CACHE", {})
 
@@ -34,6 +35,16 @@ def infer_mde(video_tensor, mde_model="moge"):
             instrisics_infered = torch.stack(uni_focal).cpu().squeeze()
             depth_infered = torch.stack(depths).unsqueeze(-1).cpu().squeeze()
 
+            H, W = video_tensor.shape[2], video_tensor.shape[3]
+            fov_deg = 60.0
+            fx =  (W / 2.0) / math.tan(math.radians(fov_deg / 2))
+            K = torch.tensor([
+                [fx,   0, W / 2.0],
+                [ 0,  fx, H / 2.0],
+                [ 0,   0,     1.0]
+            ], dtype=torch.float32)
+            instrisics_infered = K.unsqueeze(0).expand(video_tensor.shape[1], -1, -1)
+
         case "d-any-v2":
             if "d-any-v2" not in _MODEL_CACHE:
                 sys.path.append("/home/manuelf/Depth-Anything-V2")
@@ -55,7 +66,20 @@ def infer_mde(video_tensor, mde_model="moge"):
                 depth = model.infer_image(video_tensor[0, frame].to("cuda:0").cpu().numpy())
                 depths.append(torch.tensor(depth))
 
-            depth_infered = 1 / torch.clip(torch.stack(depths).unsqueeze(-1).cpu().squeeze(), 100)
+            depth_infered = (torch.stack(depths).unsqueeze(-1).cpu().squeeze())
+            depth_infered = depth_infered - (depth_infered.max() + depth_infered.min())
+            depth_infered = depth_infered.abs()
+            
+            H, W = video_tensor.shape[2], video_tensor.shape[3]
+            fov_deg = 90.0
+            fx =  (W / 2.0) / math.tan(math.radians(fov_deg / 2))
+            K = torch.tensor([
+                [fx,   0, W / 2.0],
+                [ 0,  fx, H / 2.0],
+                [ 0,   0,     1.0]
+            ], dtype=torch.float32)
+            instrisics_infered = K.unsqueeze(0).expand(video_tensor.shape[1], -1, -1)
+
 
         case "moge":
             if "moge" not in _MODEL_CACHE:

@@ -453,6 +453,7 @@ def projective_factorization_fast(obs_mat_scaled):
     Mf2 = M.reshape(F, 3, 3)                             # (F, 3, 3)
     Up, Sp, Vhp = torch.linalg.svd(Mf2)               # all F at once
     R_batch = Up @ Vhp                                 # (F, 3, 3)
+    R_batch = Mf2
 
     # Fix det < 0
     dets = torch.linalg.det(R_batch)                   # (F,)
@@ -462,6 +463,7 @@ def projective_factorization_fast(obs_mat_scaled):
 
     M = R_batch.reshape(3 * F, 3)
     scales = Sp.mean(dim=1)                            # (F,)
+    print(Sp)
 
     return M, S, T_vec, scales
 

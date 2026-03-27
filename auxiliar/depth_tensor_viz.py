@@ -160,6 +160,65 @@ def k3d_3d_plot(point_input, color_input=None, camera_input=None, scale=70):
     plot.display()
 
 
+def rerun_3d_plot(point_input, color_input=None, camera_input=None, entity_prefix="scene"):
+    """
+    Rerun-based alternative to k3d_3d_plot. Much faster for large point clouds.
+    Call rr.init(..., spawn=True) once in your notebook before using this.
+
+    Args:
+        point_input    : (3, N) or (N, 3) tensor/array, or list of such arrays.
+        color_input    : (N, 3) float [0,1] or uint8 RGB array, or list of such arrays.
+        camera_input   : list of (3, 4) camera matrices [R | t].
+        entity_prefix  : rerun entity path prefix (change to avoid overwriting previous logs).
+    """
+    import rerun as rr
+
+    # ---- Points ----
+    if point_input is not None:
+        if not isinstance(point_input, (list, tuple)):
+            point_input = [point_input]
+        if color_input is not None and not isinstance(color_input, (list, tuple)):
+            color_input = [color_input]
+
+        for i, p in enumerate(point_input):
+            if torch.is_tensor(p): p = p.detach().cpu().numpy()
+            p = p.T if p.shape[0] == 3 else p          # ensure (N, 3)
+            p = p.astype(np.float32)
+
+            kwargs = {}
+            if color_input is not None and i < len(color_input):
+                c = color_input[i]
+                if torch.is_tensor(c): c = c.detach().cpu().numpy()
+                if c.max() <= 1.01: c = (c * 255).astype(np.uint8)
+                kwargs["colors"] = c.astype(np.uint8)
+
+            rr.log(f"{entity_prefix}/points/{i}", rr.Points3D(p, **kwargs))
+
+    # ---- Cameras ----
+    if camera_input is not None:
+        if not isinstance(camera_input, (list, tuple)):
+            camera_input = [camera_input]
+
+        for i, P in enumerate(camera_input):
+            if torch.is_tensor(P): P = P.detach().cpu().numpy()
+            R = P[:3, :3]
+            t = P[:3,  3]
+            C = -R.T @ t  # camera center in world coords
+
+            # Rerun expects world-from-camera transform
+            rr.log(
+                f"{entity_prefix}/cameras/{i}",
+                rr.Transform3D(
+                    translation=C.astype(np.float32),
+                    mat3x3=R.T.astype(np.float32),
+                ),
+            )
+            rr.log(
+                f"{entity_prefix}/cameras/{i}",
+                rr.Pinhole(focal_length=100.0, width=160, height=120),
+            )
+
+
 def plot_depth_tensor_grid(
     depth_tensor,  # (num_frames, H, W, 1) or (num_frames, H, W)
     nrows=None,
@@ -197,16 +256,23 @@ def plot_depth_tensor_grid(
 
     # Compute number of frames to plot
     frames_to_plot = max(0, total_frames - start_frame)
+    end_frame = min(start_frame + frames_to_plot, total_frames)
 
     # Auto grid size if not provided
     if nrows is None or ncols is None:
         ncols = int(math.ceil(math.sqrt(frames_to_plot)))
         nrows = int(math.ceil(frames_to_plot / ncols))
 
+    # Precompute shared color range to avoid per-frame normalization
+    depth_slice = depth[start_frame:end_frame]
+    vmin, vmax = float(depth_slice.min()), float(depth_slice.max())
+    frame_maxes = depth_slice.min(axis=(1, 2))
+
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
     axes = axes.flatten() if isinstance(axes, (list, np.ndarray)) or axes.ndim > 0 else [axes]
 
     total_slots = len(axes)
+    has_overlay = obs_mat is not None and features is not None
 
     for i in range(frames_to_plot):
         idx = start_frame + i
@@ -214,23 +280,22 @@ def plot_depth_tensor_grid(
             break
 
         ax = axes[i]
-        ax.imshow(depth[idx, ...])
-        if obs_mat is not None and features is not None:
-            ax.scatter(
+        ax.imshow(depth[idx], vmin=vmin, vmax=vmax, interpolation='nearest', cmap='plasma_r')
+        if has_overlay:
+            ax.plot(
                 obs_mat[idx * 2, features],
                 obs_mat[idx * 2 + 1, features],
-                s=6,
-                c="red",
+                'r.', ms=3,
             )
-        ax.set_title(f"Frame {idx + 1}, max depth: {depth[idx].max():.2f}")
+        ax.set_title(f"Frame {idx + 1}, min depth: {frame_maxes[i]:.2f}")
         ax.axis("off")
 
     # Hide unused subplots
     for j in range(frames_to_plot, total_slots):
         axes[j].axis("off")
 
-    plt.tight_layout()
     fig.colorbar(axes[0].images[0], ax=axes, orientation='vertical', fraction=0.02, pad=0.04)
+    fig.tight_layout()
     if show:
         plt.show()
 
