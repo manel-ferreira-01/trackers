@@ -250,6 +250,8 @@ def plot_depth_tensor_grid(
     else:
         depth = depth_tensor.squeeze()
 
+    depth = np.clip(depth,0, 15)
+
     total_frames = depth.shape[0]
     if total_frames == 0:
         raise ValueError("Depth tensor has zero frames.")

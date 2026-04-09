@@ -2,7 +2,7 @@ import torch
 from src.mat_compl import calibrate_with_completion, filter_visibility, check_visibility
 from src.projective_factorization import projective_factorization_fast
 from auxiliar.depth_tensor_viz import k3d_3d_plot
-
+from src.manel_test_code import projective_joint_imputation
 
 def run_projective_reconstruction(
     W_mat: torch.Tensor,
@@ -14,6 +14,7 @@ def run_projective_reconstruction(
     offset_mode: str = "normalize",
     removal_iters: tuple = (10, 20, 30, 40),
     plot: bool = True,
+    min_obs: int = 2,
 ) -> dict:
     """
     Full projective reconstruction pipeline: filter visibility, complete the
@@ -64,9 +65,20 @@ def run_projective_reconstruction(
     print(f"NaNs after filter_visibility: {nan_pct:.2f}%")
 
     # --- Matrix completion ---
-    o, compl_W_lam, M, mask_f, surviving_frames, surviving_cols = calibrate_with_completion(
-        tracks_f, lam_f, mask_f, iters=iters, offset_mode=offset_mode, removal_iters=removal_iters,
-    )
+    surviving_frames = torch.ones(tracks_f.shape[0] // 3, dtype=torch.bool, device=tracks_f.device)
+    surviving_cols   = torch.ones(tracks_f.shape[1],       dtype=torch.bool, device=tracks_f.device)
+
+    if 1:
+        o, compl_W_lam, M, mask_f, surviving_frames, surviving_cols = calibrate_with_completion(
+            tracks_f, lam_f, mask_f, iters=iters, offset_mode=offset_mode, removal_iters=removal_iters,
+            min_obs=min_obs)
+    else:
+        compl_W_lam, _, o, _, _ = projective_joint_imputation(
+            tracks_f, lam_f, mask_f,
+            iter_outer=50, iter_inner=10, verbose=True,
+        )
+        # o here is the offsets tensor (F,); no M needed downstream
+        M = mask_f  # downstream M is only used for the row/col drop, which is a no-op here
 
     # --- Align vf/vp to surviving frames/cols ---
     vp_indices = vp.nonzero(as_tuple=True)[0]
@@ -81,27 +93,39 @@ def run_projective_reconstruction(
     M           = M[sel_rows][:, surviving_cols]
     mask_f      = mask_f[sel_rows][:, surviving_cols]
 
-    # --- Projective factorization with alpha scaling ---
-    motion, shape, tvec, alphas = projective_factorization_fast(compl_W_lam)
-    print("Alphas before scaling:", alphas)
-
+    # scale correction
+    F_frames = compl_W_lam.shape[0] // 3
     compl_W_lam_scaled = compl_W_lam.clone()
-    current_scales = torch.ones_like(alphas)
+    current_scales = torch.ones(F_frames, device=compl_W_lam.device)  # (F,)
 
+    W_corr = compl_W_lam_scaled.clone()
     for i in range(num_scale_iters):
-        motion, shape, tvec, alphas = projective_factorization_fast(
-            compl_W_lam_scaled / current_scales.repeat_interleave(3, 0)[:, None]
-        )
-        current_scales *= alphas / alphas.max()
-        print(f"  iter {i + 1} alphas: {alphas}")
+        # per-frame scale
+        scl_map = current_scales.repeat_interleave(3)[:, None]
+        motion, shape, tvec, sigmas = projective_factorization_fast(W_corr / scl_map)
+        scales = sigmas.mean(dim=1)
+        scales = scales / scales.max()
+        current_scales = current_scales * scales
+
+        # focal correction on the scale-corrected matrix
+        #W_scaled = W_corr / current_scales.repeat_interleave(3)[:, None]
+        #_, _, _, sigmas2 = projective_factorization_fast(W_scaled)
+        #f_corr = (sigmas2[:, :2].mean(dim=1) / sigmas2[:, 2]).mean()   # (F,) per-frame
+        #W_corr[0::3] /= f_corr
+        #W_corr[1::3] /= f_corr
+        print(sigmas)
+        #print(f"  iter {i+1}: scales={current_scales}  f_corr={f_corr}")
 
     # --- Final matrices ---
-    final_W_lam = compl_W_lam_scaled / current_scales.repeat_interleave(3, 0)[:, None]
+    final_W_lam = W_corr / current_scales.repeat_interleave(3)[:, None]
     final_lam = final_W_lam[2::3]
     final_W   = final_W_lam / final_lam.repeat_interleave(3, dim=0)
 
-    print("current_scales:", current_scales)
-    print("Final alphas:  ", alphas)
+    print("final_scales", current_scales)
+
+    #print("current_scales:", current_scales)
+    #print("Final alphas:  ", alphas)
+    motion, shape, tvec, sing_vals = projective_factorization_fast(final_W_lam)
 
     # --- Build camera list aligned to first camera ---
     R1_inv = motion[:3, :3].t()
@@ -111,7 +135,7 @@ def run_projective_reconstruction(
         Mi = motion[f * 3: (f + 1) * 3, :]
         ti = tvec[f * 3: (f + 1) * 3]
         Mi_new = Mi @ R1_inv
-        cam_lists.append(torch.cat((Mi_new, ti - Mi_new @ t1_est), dim=1))
+        cam_lists.append(torch.cat((Mi_new, ti - (Mi_new @ t1_est)), dim=1))
 
     aligned_shape = motion[:3, :3] @ shape + t1_est
 

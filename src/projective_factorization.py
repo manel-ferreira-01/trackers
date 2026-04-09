@@ -453,19 +453,18 @@ def projective_factorization_fast(obs_mat_scaled):
     Mf2 = M.reshape(F, 3, 3)                             # (F, 3, 3)
     Up, Sp, Vhp = torch.linalg.svd(Mf2)               # all F at once
     R_batch = Up @ Vhp                                 # (F, 3, 3)
-    R_batch = Mf2
+    #R_batch = Mf2
 
     # Fix det < 0
-    dets = torch.linalg.det(R_batch)                   # (F,)
-    flip = torch.ones(F, 1, 1, device=device, dtype=dtype)
-    flip[dets < 0] = 1.0
-    R_batch = R_batch * flip
+    #dets = torch.linalg.det(R_batch)                   # (F,)
+    #flip = torch.ones(F, 1, 1, device=device, dtype=dtype)
+    #flip[dets < 0] = 1.0
+    #R_batch = R_batch * flip
 
-    M = R_batch.reshape(3 * F, 3)
+    M =R_batch.reshape(3 * F, 3)
     scales = Sp.mean(dim=1)                            # (F,)
-    print(Sp)
 
-    return M, S, T_vec, scales
+    return  M, S, T_vec, Sp
 
 import torch
 import numpy as np
@@ -569,6 +568,14 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
     rel_alg = normalize(cam_lists)
     rel_gt  = normalize(gt_lists)
 
+    #print("rel_alg",torch.tensor(rel_alg))
+    #print("rel_gt", torch.tensor(rel_gt))
+
+    #print(torch.tensor(rel_alg) - torch.tensor(rel_gt))
+
+    print([np.linalg.det(cam[:3,:3]) for cam in rel_alg])
+
+
     rot_errors  = []
     dir_errors  = []
     norms_alg   = []  # ← collect here
@@ -578,9 +585,13 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
         # --- Rotation Error ---
         R_alg = rel_alg[i][:3, :3]
         R_gt  = rel_gt[i][:3, :3]
+
+        #print(np.linalg.det(R_alg), np.linalg.det(R_gt))
+
         R_diff    = R_alg @ R_gt.T
         trace_val = (np.trace(R_diff) - 1) / 2.0
-        rot_err   = np.degrees(np.arccos(np.clip(trace_val, -1.0, 1.0)))
+        print(trace_val)
+        rot_err   = np.degrees(np.arccos((trace_val)))
         rot_errors.append(rot_err)
 
         # --- Translation ---

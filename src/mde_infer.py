@@ -4,7 +4,9 @@ import numpy as np
 from tqdm import tqdm
 import math
 
+
 _MODEL_CACHE = globals().get("_MODEL_CACHE", {})
+_MODEL_CACHE = {}
 
 def infer_mde(video_tensor, mde_model="moge"):
 
@@ -36,28 +38,33 @@ def infer_mde(video_tensor, mde_model="moge"):
             depth_infered = torch.stack(depths).unsqueeze(-1).cpu().squeeze()
 
             H, W = video_tensor.shape[2], video_tensor.shape[3]
-            fov_deg = 60.0
+            fov_deg = 80.0
             fx =  (W / 2.0) / math.tan(math.radians(fov_deg / 2))
             K = torch.tensor([
                 [fx,   0, W / 2.0],
                 [ 0,  fx, H / 2.0],
                 [ 0,   0,     1.0]
             ], dtype=torch.float32)
-            instrisics_infered = K.unsqueeze(0).expand(video_tensor.shape[1], -1, -1)
+            #instrisics_infered = K.unsqueeze(0).repeat(video_tensor.shape[1], 1, 1)
+            #instrisics_infered[:,0,0] *= 0.75
+            #instrisics_infered[:,1,1] *= 0.75
+
 
         case "d-any-v2":
             if "d-any-v2" not in _MODEL_CACHE:
-                sys.path.append("/home/manuelf/Depth-Anything-V2")
+                sys.path.append("/home/manuelf/Depth-Anything-V2/metric_depth")
                 from depth_anything_v2.dpt import DepthAnythingV2
                 encoder = 'vitl'
+                dataset = 'hypersim' # 'hypersim' for indoor model, 'vkitti' for outdoor model
+                max_depth = 80
                 model_configs = {
                     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
                     'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
                     'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
                     'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
                 }
-                m = DepthAnythingV2(**model_configs[encoder])
-                m.load_state_dict(torch.load(f'/home/manuelf/Depth-Anything-V2/checkpoints/depth_anything_v2_{encoder}.pth', map_location='cpu'))
+                m = DepthAnythingV2(**model_configs[encoder], max_depth=max_depth)
+                m.load_state_dict(torch.load(f'/home/manuelf/Depth-Anything-V2/checkpoints/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
                 _MODEL_CACHE["d-any-v2"] = m.to("cuda:0").eval()
 
             model = _MODEL_CACHE["d-any-v2"]
@@ -67,8 +74,8 @@ def infer_mde(video_tensor, mde_model="moge"):
                 depths.append(torch.tensor(depth))
 
             depth_infered = (torch.stack(depths).unsqueeze(-1).cpu().squeeze())
-            depth_infered = depth_infered - (depth_infered.max() + depth_infered.min())
-            depth_infered = depth_infered.abs()
+            #depth_infered = depth_infered - (depth_infered.max() + depth_infered.min())
+            #depth_infered = depth_infered.abs()
             
             H, W = video_tensor.shape[2], video_tensor.shape[3]
             fov_deg = 90.0
@@ -98,6 +105,19 @@ def infer_mde(video_tensor, mde_model="moge"):
             instrisics_infered = torch.stack(instrisics).cpu().squeeze()
             instrisics_infered[:, 1, :] *= video_tensor.shape[2]
             instrisics_infered[:, 0, :] *= video_tensor.shape[3]
+
+            H, W = video_tensor.shape[2], video_tensor.shape[3]
+            fov_deg = 80.0
+            fx =  (W / 2.0) / math.tan(math.radians(fov_deg / 2))
+            K = torch.tensor([
+                [fx,   0, W / 2.0],
+                [ 0,  fx, H / 2.0],
+                [ 0,   0,     1.0]
+            ], dtype=torch.float32)
+            #instrisics_infered = K.unsqueeze(0).repeat(video_tensor.shape[1], 1, 1)
+            #instrisics_infered[0,0,0] *= 0.5
+            #instrisics_infered[0,1,1] *= 0.5
+
 
     torch.cuda.empty_cache()
     return depth_infered, instrisics_infered

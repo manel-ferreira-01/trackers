@@ -155,7 +155,8 @@ def incremental_matrix_completion(
 
 
 def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ridge=1e-3,
-                              offset_mode="normalize", removal_iters=(10, 20, 30, 40)):
+                              offset_mode="normalize", removal_iters=(10, 20, 30, 40),
+                              min_obs=2):
     """
     Jointly estimates per-frame affine depth calibration (scale + offset)
     and completes missing entries, such that (d*lam + o) * tracks is rank-4.
@@ -195,6 +196,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
 
     d = torch.ones(F_orig,  device=device, dtype=dtype)
     o = torch.zeros(F_orig, device=device, dtype=dtype)
+    frame_scales = torch.ones(F_orig, device=device, dtype=dtype)  # accumulated per-frame scales
 
     offset_history = []
     eye_r          = ridge * torch.eye(rank, device=device, dtype=dtype)
@@ -251,12 +253,14 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
 
             # --- Columns: bad in too many frames ---
             bad_col_count = bad_fp.sum(dim=0)
-            remove_cols   = bad_col_count > (F_w - rank)
+            col_thresh    = max(F_w - 2, 1)          # avoid 0 threshold with few frames
+            remove_cols   = bad_col_count >= col_thresh
             keep_cols     = ~remove_cols
 
             # --- Rows: bad in too many points ---
             bad_row_count = bad_fp.sum(dim=1)
-            remove_frames = bad_row_count > (P_w - rank)
+            row_thresh    = max(P_w - 2, 1)          # avoid 0 threshold with few points
+            remove_frames = bad_row_count >= row_thresh
             keep_frames   = ~remove_frames
 
             # Per-entry masking only for entries NOT in removed rows/cols
@@ -267,11 +271,12 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
             mask_w = mask_w & ~bad_fp_entry.repeat_interleave(3, dim=0)
 
             # Under-observed after per-entry masking
+            # clamp to actual frame/point count so 2-frame windows aren't emptied
             obs_per_point = mask_w[0::3].sum(dim=0)
-            keep_cols     = keep_cols & (obs_per_point >= rank)
+            keep_cols     = keep_cols & (obs_per_point >= min(min_obs, F_w))
 
             obs_per_frame = mask_w[0::3].sum(dim=1)
-            keep_frames   = keep_frames & (obs_per_frame >= rank)
+            keep_frames   = keep_frames & (obs_per_frame >= min(min_obs, P_w))
 
             n_rem_cols   = (~keep_cols).sum().item()
             n_rem_frames = (~keep_frames).sum().item()
@@ -332,10 +337,27 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
                 o = torch.zeros_like(o)
         else:
             o = torch.zeros_like(o)
-        
-            
 
         d = torch.ones_like(d)
+        #d = d / d.mean()
+        # ---- Per-frame scale + focal correction from singular values ----
+        if it > 60:
+            pass
+            #_, _, _, sigmas = projective_factorization_fast(M)        # (F_w, 3)
+            #scales = sigmas.mean(dim=1)                                # (F_w,) mean sv per frame
+            #scales = scales / scales.max()
+            #d = d / scales
+            #print("iter", it, "d", sigmas)
+
+            ## focal correction: factorize d-corrected M to isolate σ_xy / σ_z
+            #M_d = d.repeat_interleave(3)[:, None] * M                 # (3F_w, P_w)
+            #_, _, _, sigmas2 = projective_factorization_fast(M_d)     # (F_w, 3)
+            #f_corr = (sigmas2[:, :2].mean(dim=1) / sigmas2[:, 2]).mean()
+            #print("iter", it, "offset", o, "f_corr", f_corr)
+            #if abs(f_corr.item() - 1.0) > 0.01:                       # stop when converged
+            #    tracks_w[0::3] /= f_corr
+            #    tracks_w[1::3] /= f_corr
+
         offset_history.append(o.clone())
 
         # ---- Convergence ----
@@ -402,6 +424,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
         plt.title("Offset evolution per frame")
         plt.xlabel("Iteration")
         plt.ylabel("Offset value")
+        plt.legend()
         plt.grid(True, alpha=0.3)
         plt.show()
 
@@ -415,6 +438,8 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
     plt.xlabel("Point")
     plt.ylabel("Frame")
     plt.show()
+
+    
 
     return o_full, W_final, M_full, mask_out.float(), active_frames, active_cols
 
@@ -443,16 +468,20 @@ def check_visibility(mask_F, rank=4):
 
 # And filter to only keep valid points/frames
 def filter_visibility(tracks, lam, mask, rank=4):
-    mask_F       = mask[0::3]                            # (F, P)
+    mask_F       = mask[0::3]
     valid_frames = torch.ones(mask_F.shape[0], dtype=torch.bool)
     valid_points = torch.ones(mask_F.shape[1], dtype=torch.bool)
 
     for _ in range(100):
+        F, P = mask_F.shape
+        frame_thresh = min(rank, P)
+        point_thresh = min(rank, F)
+
         obs_per_frame = mask_F.sum(dim=1)
         obs_per_point = mask_F.sum(dim=0)
 
-        new_vf = obs_per_frame >= rank
-        new_vp = obs_per_point >= rank
+        new_vf = obs_per_frame >= frame_thresh
+        new_vp = obs_per_point >= point_thresh
 
         if new_vf.all() and new_vp.all():
             break
@@ -461,7 +490,6 @@ def filter_visibility(tracks, lam, mask, rank=4):
         tracks = tracks[new_vf.repeat_interleave(3)][:, new_vp]
         lam    = lam[new_vf][:, new_vp]
 
-        # accumulate valid indices
         valid_frames[valid_frames.clone()] = new_vf
         valid_points[valid_points.clone()] = new_vp
 

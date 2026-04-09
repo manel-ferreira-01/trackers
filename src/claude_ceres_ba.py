@@ -62,7 +62,7 @@ class ReprojectionError(pyceres.CostFunction):
         return True
 
 
-def run_bundle_adjustment_ceres(rotations, translations, points_3d, points_2d, K):
+def run_bundle_adjustment_ceres(rotations, translations, points_3d, points_2d, K, fix_points=False):
 
     # Convert to rvecs
     rvecs = []
@@ -96,6 +96,8 @@ def run_bundle_adjustment_ceres(rotations, translations, points_3d, points_2d, K
                 pyceres.HuberLoss(1.0),         # robust to outliers
                 [rvec, tvec, pts3d[pt_idx]]
             )
+            if fix_points:
+                problem.set_parameter_block_constant(pts3d[pt_idx])
 
     options = pyceres.SolverOptions()
     options.linear_solver_type           = pyceres.LinearSolverType.SPARSE_SCHUR

@@ -91,6 +91,8 @@ def run_reconstruction(
             iter_Lambda = (Lambda + off_map) / scl_map
 
             motion, shape, tvec, scales = projective_factorization_fast(iter_Lambda * W_mat)
+            print(scales)
+            scales = scales.mean(dim=1)  # (F,) average singular value per frame
 
             scales = scales / scales.max()
             current_scales = current_scales * scales
