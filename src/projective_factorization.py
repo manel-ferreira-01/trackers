@@ -554,57 +554,66 @@ def get_subspace_outlier_indices(W, rank=4, threshold=100.0, use_relative=False,
     return new_W, outlier_mask, residuals
 
 def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
-    
+
     def to_4x4(m):
         if isinstance(m, torch.Tensor):
             m = m.detach().cpu().numpy()
         return np.vstack([m, [0, 0, 0, 1]])
 
+    def is_nan_cam(m):
+        arr = m.detach().cpu().numpy() if isinstance(m, torch.Tensor) else np.asarray(m)
+        return np.any(np.isnan(arr))
+
     def normalize(traj):
-        m4x4 = [to_4x4(m) for m in traj]
-        m0_inv = np.linalg.inv(m4x4[0])
-        return [m @ m0_inv for m in m4x4]
+        m4x4 = [None if is_nan_cam(m) else to_4x4(m) for m in traj]
+        # find first valid frame to use as reference
+        ref = next((m for m in m4x4 if m is not None), None)
+        if ref is None:
+            return [None] * len(traj)
+        ref_inv = np.linalg.inv(ref)
+        return [None if m is None else m @ ref_inv for m in m4x4]
 
     rel_alg = normalize(cam_lists)
     rel_gt  = normalize(gt_lists)
 
-    #print("rel_alg",torch.tensor(rel_alg))
-    #print("rel_gt", torch.tensor(rel_gt))
-
-    #print(torch.tensor(rel_alg) - torch.tensor(rel_gt))
-
-    print([np.linalg.det(cam[:3,:3]) for cam in rel_alg])
-
+    print([np.linalg.det(cam[:3,:3]) if cam is not None else float('nan') for cam in rel_alg])
 
     rot_errors  = []
     dir_errors  = []
-    norms_alg   = []  # ← collect here
-    norms_gt    = []  # ← collect here
+    norms_alg   = []
+    norms_gt    = []
 
     for i in range(1, len(rel_alg)):
+        if rel_alg[i] is None or rel_gt[i] is None:
+            rot_errors.append(np.nan)
+            dir_errors.append(np.nan)
+            norms_alg.append(np.nan)
+            norms_gt.append(np.nan)
+            continue
+
         # --- Rotation Error ---
         R_alg = rel_alg[i][:3, :3]
         R_gt  = rel_gt[i][:3, :3]
 
-        #print(np.linalg.det(R_alg), np.linalg.det(R_gt))
-
         R_diff    = R_alg @ R_gt.T
         trace_val = (np.trace(R_diff) - 1) / 2.0
         print(trace_val)
-        rot_err   = np.degrees(np.arccos((trace_val)))
+        rot_err   = np.degrees(np.arccos(np.clip(trace_val, -1.0, 1.0)))
         rot_errors.append(rot_err)
 
         # --- Translation ---
         t_alg    = rel_alg[i][:3, 3]
         t_gt     = rel_gt[i][:3, 3]
+        print("t_alg", t_alg)
+        print("t_gt", t_gt)
         norm_alg = np.linalg.norm(t_alg)
         norm_gt  = np.linalg.norm(t_gt)
 
-        norms_alg.append(norm_alg)  # ← save
-        norms_gt.append(norm_gt)    # ← save
+        norms_alg.append(norm_alg)
+        norms_gt.append(norm_gt)
 
         if norm_alg < min_t_mag or norm_gt < min_t_mag:
-            dir_errors.append(np.nan)   # exclude near-zero baselines
+            dir_errors.append(np.nan)
         else:
             unit_alg = t_alg / norm_alg
             unit_gt  = t_gt  / norm_gt
@@ -612,10 +621,10 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
             dir_errors.append(np.degrees(np.arccos(np.clip(dot, -1.0, 1.0))))
 
     return {
-        "mean_rot":  np.mean(rot_errors),
+        "mean_rot":  np.nanmean(rot_errors),
         "mean_dir":  np.nanmean(dir_errors),
         "rot_list":  rot_errors,
         "dir_list":  dir_errors,
-        "norm_alg":  norms_alg,   # (F-1,) one per relative frame
+        "norm_alg":  norms_alg,
         "norm_gt":   norms_gt,
     }

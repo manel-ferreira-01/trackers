@@ -120,11 +120,10 @@ def run_projective_reconstruction(
     final_W_lam = W_corr / current_scales.repeat_interleave(3)[:, None]
     final_lam = final_W_lam[2::3]
     final_W   = final_W_lam / final_lam.repeat_interleave(3, dim=0)
+    final_M = M  / current_scales.repeat_interleave(3)[:, None]
 
     print("final_scales", current_scales)
 
-    #print("current_scales:", current_scales)
-    #print("Final alphas:  ", alphas)
     motion, shape, tvec, sing_vals = projective_factorization_fast(final_W_lam)
 
     # --- Build camera list aligned to first camera ---
@@ -151,6 +150,7 @@ def run_projective_reconstruction(
         current_scales=current_scales,
         offsets=o,
         vf=vf,
+        M=M,
         vp=vp,
         mask_f=mask_f,
         surviving_frames=surviving_frames,

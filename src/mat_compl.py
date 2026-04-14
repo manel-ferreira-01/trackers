@@ -204,19 +204,24 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
     # --- SVD initialisation ---
     lam3_w   = lam_w.repeat_interleave(3, dim=0)
     W_init   = lam3_w * tracks_w
-    col_mean = torch.nanmean(W_init, dim=0)
-    W_filled = torch.where(mask_w, W_init,
-                           col_mean.unsqueeze(0).expand_as(W_init))
+    W_init_z = torch.where(mask_w, W_init, torch.zeros_like(W_init))  # zeros for missing
 
-    Ui, Si, Vhi = torch.linalg.svd(W_filled, full_matrices=False)
-    U = (Ui[:, :rank] * Si[:rank].sqrt()).contiguous()   # (3F, rank)
-    V = (Vhi[:rank].T * Si[:rank].sqrt()).contiguous()   # (P,  rank)
+
+    #W_filled_warm = windowed_init(
+    #    W_init_z, mask_w, rank=rank,
+    #    window_size=5, overlap=2, ridge=ridge, iters=30
+    #)
+    #import matplotlib.pyplot as plt
+    #plt.imshow(W_filled_warm.cpu().numpy(), aspect='auto', cmap='hot_r', interpolation='none')
+    #plt.colorbar()
+
+    Ui, Si, Vhi = torch.linalg.svd(W_init_z, full_matrices=False)
+    U = (Ui[:, :rank] * Si[:rank].sqrt()).contiguous()
+    V = (Vhi[:rank].T * Si[:rank].sqrt()).contiguous()
     M = U @ V.T
 
-    best = (float('inf'), d.clone(), o.clone(), M.clone(),
-            active_cols.clone(), active_frames.clone(),
-            lam_w.clone(), tracks_w.clone(), mask_w.clone())  # snapshot working tensors
-    
+    prev_rho = float('inf')
+
     for it in range(iters):
         F_w = lam_w.shape[0]
         P_w = lam_w.shape[1]
@@ -341,23 +346,6 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
         d = torch.ones_like(d)
         #d = d / d.mean()
         # ---- Per-frame scale + focal correction from singular values ----
-        if it > 60:
-            pass
-            #_, _, _, sigmas = projective_factorization_fast(M)        # (F_w, 3)
-            #scales = sigmas.mean(dim=1)                                # (F_w,) mean sv per frame
-            #scales = scales / scales.max()
-            #d = d / scales
-            #print("iter", it, "d", sigmas)
-
-            ## focal correction: factorize d-corrected M to isolate σ_xy / σ_z
-            #M_d = d.repeat_interleave(3)[:, None] * M                 # (3F_w, P_w)
-            #_, _, _, sigmas2 = projective_factorization_fast(M_d)     # (F_w, 3)
-            #f_corr = (sigmas2[:, :2].mean(dim=1) / sigmas2[:, 2]).mean()
-            #print("iter", it, "offset", o, "f_corr", f_corr)
-            #if abs(f_corr.item() - 1.0) > 0.01:                       # stop when converged
-            #    tracks_w[0::3] /= f_corr
-            #    tracks_w[1::3] /= f_corr
-
         offset_history.append(o.clone())
 
         # ---- Convergence ----
@@ -368,13 +356,14 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
         
         rho      = (W_scaled - M)[mask_w].norm().item()
 
-        #if rho < best[0] - tol:
-        best = (rho, d.clone(), o.clone(), M.clone(),
-                    active_cols.clone(), active_frames.clone(),
-                    lam_w.clone(), tracks_w.clone(), mask_w.clone())
+        if it > 50 and abs(prev_rho - rho) < tol and (len(offset_history) < 2 or torch.allclose(offset_history[-1], offset_history[-2], atol=tol)):
+            print(f"Converged at iteration {it} with step {abs(prev_rho - rho):.6f} and stable offset")
+            break
+        prev_rho = rho
 
 
-    _, d, o, M_best, best_cols, best_frames, lam_w, tracks_w, mask_w = best
+    M_best = M
+    best_cols, best_frames = active_cols, active_frames
     best_rows = best_frames.repeat_interleave(3)
 
 
@@ -431,13 +420,14 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
 
     #cell_res    = (W_comp - M_best) ** 2
     #cell_res_fp = cell_res.reshape(lam_w.shape[0], 3, lam_w.shape[1]).max(dim=1).values
-    plt.figure(figsize=(14, 5))
-    plt.imshow(cell_res_fp.cpu().numpy(), aspect='auto', cmap='hot_r', interpolation='none')
-    plt.colorbar()
-    plt.title("Per frame-point residual (surviving entries)")
-    plt.xlabel("Point")
-    plt.ylabel("Frame")
-    plt.show()
+    if cell_res_fp is not None:
+        plt.figure(figsize=(14, 5))
+        plt.imshow(cell_res_fp.cpu().numpy(), aspect='auto', cmap='hot_r', interpolation='none')
+        plt.colorbar()
+        plt.title("Per frame-point residual (surviving entries)")
+        plt.xlabel("Point")
+        plt.ylabel("Frame")
+        plt.show()
 
     
 
@@ -495,3 +485,79 @@ def filter_visibility(tracks, lam, mask, rank=4):
 
     print(f"After filtering: F={mask_F.shape[0]}, P={mask_F.shape[1]}")
     return tracks, lam, mask_F.repeat_interleave(3, dim=0), valid_frames, valid_points
+
+
+
+def windowed_init(W_obs, mask_w, rank=4, window_size=25, overlap=10, ridge=1e-3, iters=30):
+    """
+    Warm-start initialization for ALS by factorizing overlapping frame windows.
+
+    W_obs  : (3F, P) — observed measurement matrix (zeros where missing, not NaN)
+    mask_w : (3F, P) — bool, True where observed
+    Returns: W_filled (3F, P) — dense matrix suitable for SVD initialization
+    """
+    device = W_obs.device
+    dtype  = W_obs.dtype
+    n_rows, P = W_obs.shape
+    F = n_rows // 3
+
+    # Accumulate weighted completions
+    W_acc    = torch.zeros_like(W_obs)
+    W_weight = torch.zeros(n_rows, P, device=device, dtype=dtype)
+
+    step = max(window_size - overlap, 1)
+    starts = list(range(0, F, step))
+    # Ensure last window reaches the end
+    if starts[-1] + window_size < F:
+        starts.append(F - window_size)
+
+    eye_r = ridge * torch.eye(rank, device=device, dtype=dtype)
+
+    for start in starts:
+        end = min(start + window_size, F)
+        row_slice = slice(start * 3, end * 3)
+
+        W_sub   = W_obs[row_slice]     # (3*win, P)
+        mask_sub = mask_w[row_slice]   # (3*win, P)
+
+        # Keep only columns with ≥2 observations in this window
+        col_obs  = mask_sub[0::3].sum(0)   # (P,) — use x-rows as proxy
+        good_col = col_obs >= 2
+        if good_col.sum() < rank:
+            continue
+
+        Ws = W_sub[:, good_col]
+        ms = mask_sub[:, good_col].float()
+
+        # Quick SVD init for this window
+        col_mean = (Ws * ms).sum(0) / ms.sum(0).clamp(min=1)
+        Wf = torch.where(ms.bool(), Ws, col_mean.unsqueeze(0).expand_as(Ws))
+        Ui, Si, Vhi = torch.linalg.svd(Wf, full_matrices=False)
+        U = (Ui[:, :rank] * Si[:rank].sqrt()).contiguous()
+        V = (Vhi[:rank].T * Si[:rank].sqrt()).contiguous()
+
+        # Few ALS iterations on this window only
+        for _ in range(iters):
+            A_U = torch.einsum('ij,jk,jl->ikl', ms, V, V) + eye_r
+            b_U = (ms * Ws) @ V
+            U   = torch.linalg.solve(A_U, b_U.unsqueeze(-1)).squeeze(-1)
+
+            A_V = torch.einsum('ij,ik,il->jkl', ms, U, U) + eye_r
+            b_V = (ms * Ws).T @ U
+            V   = torch.linalg.solve(A_V, b_V.unsqueeze(-1)).squeeze(-1)
+
+        W_comp = U @ V.T  # (3*win, |good_col|)
+
+        # Weight by number of observations per column in this window
+        w = col_obs[good_col].float()  # (|good_col|,)
+        W_acc[row_slice][:, good_col]    += W_comp * w.unsqueeze(0)
+        W_weight[row_slice][:, good_col] += w.unsqueeze(0)
+
+    # Normalize overlap regions; fall back to 0 where no window covered
+    W_filled = W_acc / W_weight.clamp(min=1)
+
+    # Always trust real observations over window completions
+    W_filled = torch.where(mask_w, W_obs, W_filled)
+
+    return W_filled
+
