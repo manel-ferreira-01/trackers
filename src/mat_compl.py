@@ -3,6 +3,7 @@ from tqdm import tqdm
 import numpy as np
 from src.ortho_factorization import _update_affine_ortho, _update_affine_ortho_lstsq
 from src.projective_factorization import projective_factorization_fast
+from src.column_growing_init import column_growing_init
 
 def alternating_matrix_completion(M_obs, rank=4, max_iters=100, tol=1e-6, verbose=False, device='cpu', mode=0, lam=1e-3):
 
@@ -200,6 +201,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
 
     offset_history = []
     eye_r          = ridge * torch.eye(rank, device=device, dtype=dtype)
+    cell_res_fp    = None
 
     # --- SVD initialisation ---
     lam3_w   = lam_w.repeat_interleave(3, dim=0)
@@ -207,18 +209,16 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
     W_init_z = torch.where(mask_w, W_init, torch.zeros_like(W_init))  # zeros for missing
 
 
-    #W_filled_warm = windowed_init(
-    #    W_init_z, mask_w, rank=rank,
-    #    window_size=5, overlap=2, ridge=ridge, iters=30
-    #)
-    #import matplotlib.pyplot as plt
-    #plt.imshow(W_filled_warm.cpu().numpy(), aspect='auto', cmap='hot_r', interpolation='none')
-    #plt.colorbar()
+    if 0:
+        Ui, Si, Vhi = torch.linalg.svd(W_init_z, full_matrices=False)
+        U = (Ui[:, :rank] * Si[:rank].sqrt()).contiguous()
+        V = (Vhi[:rank].T * Si[:rank].sqrt()).contiguous()
+        M = U @ V.T
 
-    Ui, Si, Vhi = torch.linalg.svd(W_init_z, full_matrices=False)
-    U = (Ui[:, :rank] * Si[:rank].sqrt()).contiguous()
-    V = (Vhi[:rank].T * Si[:rank].sqrt()).contiguous()
-    M = U @ V.T
+    else:
+        U, V = column_growing_init(W_init_z, mask_w, rank=rank, ridge=ridge)
+        M = U @ V.T
+
 
     prev_rho = float('inf')
 
@@ -235,7 +235,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
         #W_filled = torch.where(mask_w, W_scaled, torch.zeros_like(W_scaled))
 
         # ---- Outlier removal at fixed iterations ----
-        if it in removal_iters:
+        if removal_iters and it in removal_iters:
             res_A = (W_filled - M) ** 2
 
             # --- Option B: project W_filled onto V subspace ---
@@ -252,9 +252,13 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
             cell_res    = res_A   # <-- swap to res_B or res_C to test
             cell_res_fp = cell_res.reshape(F_w, 3, P_w).max(dim=1).values
 
-            threshold   = torch.quantile(cell_res_fp, 0.9)
-            bad_fp      = cell_res_fp > threshold
-            #bad_fp = (cell_res_fp == cell_res_fp.max())
+            #threshold   = torch.quantile(cell_res_fp, 0.9)
+            #bad_fp      = cell_res_fp > threshold
+            threshold = torch.quantile(cell_res_fp, 0.95)
+            abs_floor = cell_res_fp.median() * 5.0   # only remove if residual is 5x median
+            threshold = torch.maximum(threshold, abs_floor) 
+            bad_fp = cell_res_fp > threshold
+
 
             # --- Columns: bad in too many frames ---
             bad_col_count = bad_fp.sum(dim=0)
@@ -314,6 +318,9 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
                 W_filled = torch.where(mask_w, W_scaled, torch.zeros_like(W_scaled))
                 M        = U @ V.T
 
+        if it % 10 == 0:
+           #print("iter",it, mask_w.float().mean())
+           pass
 
         mask_f = mask_w.float()
         F_w    = lam_w.shape[0]
@@ -332,7 +339,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
         M = U @ V.T
 
         # ---- Affine calibration ----
-        if it > 40:
+        if it > 50:
             d, o = _update_affine_ortho(
                 tracks_w[0::3], tracks_w[1::3], lam_w, M, mask=mask_w[0::3]
             )
@@ -343,8 +350,9 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
         else:
             o = torch.zeros_like(o)
 
-        d = torch.ones_like(d)
         #d = d / d.mean()
+        d = torch.ones_like(d)
+
         # ---- Per-frame scale + focal correction from singular values ----
         offset_history.append(o.clone())
 
@@ -390,44 +398,45 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
     o_full[best_frames] = o
 
     # ---- Diagnostics ----
-    import matplotlib.pyplot as plt
+    if 1:
+        import matplotlib.pyplot as plt
 
-    if offset_history:
-        # Pad each snapshot to F_orig length with NaN before stacking
-        history_padded = torch.full((len(offset_history), F_orig), float('nan'),
-                                     device=device, dtype=dtype)
-        af = active_frames.clone()  # final surviving frames mask
-        # Rebuild frame mask at each iteration is expensive — instead just
-        # place each snapshot into the surviving slots cumulatively.
-        # We know final active_frames; earlier snapshots are subsets of it.
-        # Simplest: just right-align by length and warn if ambiguous.
-        for i, snap in enumerate(offset_history):
-            history_padded[i, :snap.shape[0]] = snap   # left-align by current frame order
+        if offset_history:
+            # Pad each snapshot to F_orig length with NaN before stacking
+            history_padded = torch.full((len(offset_history), F_orig), float('nan'),
+                                        device=device, dtype=dtype)
+            af = active_frames.clone()  # final surviving frames mask
+            # Rebuild frame mask at each iteration is expensive — instead just
+            # place each snapshot into the surviving slots cumulatively.
+            # We know final active_frames; earlier snapshots are subsets of it.
+            # Simplest: just right-align by length and warn if ambiguous.
+            for i, snap in enumerate(offset_history):
+                history_padded[i, :snap.shape[0]] = snap   # left-align by current frame order
 
-        history_tensor = history_padded.cpu().numpy()
-        plt.figure(figsize=(10, 4))
-        for f in range(F_orig):
-            vals = history_tensor[:, f]
-            if not np.all(np.isnan(vals)):
-                plt.plot(vals, alpha=0.6, label=f"Frame {f}")
-        plt.title("Offset evolution per frame")
-        plt.xlabel("Iteration")
-        plt.ylabel("Offset value")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.show()
+            history_tensor = history_padded.cpu().numpy()
+            plt.figure(figsize=(10, 4))
+            for f in range(F_orig):
+                vals = history_tensor[:, f]
+                if not np.all(np.isnan(vals)):
+                    plt.plot(vals, alpha=0.6, label=f"Frame {f}")
+            plt.title("Offset evolution per frame")
+            plt.xlabel("Iteration")
+            plt.ylabel("Offset value")
+            #plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.show()
 
 
-    #cell_res    = (W_comp - M_best) ** 2
-    #cell_res_fp = cell_res.reshape(lam_w.shape[0], 3, lam_w.shape[1]).max(dim=1).values
-    if cell_res_fp is not None:
-        plt.figure(figsize=(14, 5))
-        plt.imshow(cell_res_fp.cpu().numpy(), aspect='auto', cmap='hot_r', interpolation='none')
-        plt.colorbar()
-        plt.title("Per frame-point residual (surviving entries)")
-        plt.xlabel("Point")
-        plt.ylabel("Frame")
-        plt.show()
+        #cell_res    = (W_comp - M_best) ** 2
+        #cell_res_fp = cell_res.reshape(lam_w.shape[0], 3, lam_w.shape[1]).max(dim=1).values
+        if cell_res_fp is not None:
+            plt.figure(figsize=(14, 5))
+            plt.imshow(cell_res_fp.cpu().numpy(), aspect='auto', cmap='hot_r', interpolation='none')
+            plt.colorbar()
+            plt.title("Per frame-point residual (surviving entries)")
+            plt.xlabel("Point")
+            plt.ylabel("Frame")
+            plt.show()
 
     
 

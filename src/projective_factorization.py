@@ -576,7 +576,7 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
     rel_alg = normalize(cam_lists)
     rel_gt  = normalize(gt_lists)
 
-    print([np.linalg.det(cam[:3,:3]) if cam is not None else float('nan') for cam in rel_alg])
+    #print([np.linalg.det(cam[:3,:3]) if cam is not None else float('nan') for cam in rel_alg])
 
     rot_errors  = []
     dir_errors  = []
@@ -597,15 +597,15 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
 
         R_diff    = R_alg @ R_gt.T
         trace_val = (np.trace(R_diff) - 1) / 2.0
-        print(trace_val)
+        #print(trace_val)
         rot_err   = np.degrees(np.arccos(np.clip(trace_val, -1.0, 1.0)))
         rot_errors.append(rot_err)
 
         # --- Translation ---
         t_alg    = rel_alg[i][:3, 3]
         t_gt     = rel_gt[i][:3, 3]
-        print("t_alg", t_alg)
-        print("t_gt", t_gt)
+        #print("t_alg", t_alg)
+        #print("t_gt", t_gt)
         norm_alg = np.linalg.norm(t_alg)
         norm_gt  = np.linalg.norm(t_gt)
 
