@@ -553,7 +553,35 @@ def get_subspace_outlier_indices(W, rank=4, threshold=100.0, use_relative=False,
         
     return new_W, outlier_mask, residuals
 
-def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
+def umeyama_alignment(src_pts, dst_pts, with_scale=True):
+    """
+    Find transform T such that T @ src ≈ dst (least squares).
+    src_pts, dst_pts: (N, 3)
+    Returns R (3x3), t (3,), s (scalar)
+    """
+    n = src_pts.shape[0]
+    mu_src = src_pts.mean(0)
+    mu_dst = dst_pts.mean(0)
+
+    src_c = src_pts - mu_src
+    dst_c = dst_pts - mu_dst
+
+    var_src = (src_c ** 2).sum() / n
+    cov = (dst_c.T @ src_c) / n
+
+    U, D, Vt = np.linalg.svd(cov)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1
+
+    R = U @ S @ Vt
+    s = (D * S.diagonal()).sum() / var_src if with_scale else 1.0
+    t = mu_dst - s * R @ mu_src
+
+    return R, t, s
+
+
+def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=True):
 
     def to_4x4(m):
         if isinstance(m, torch.Tensor):
@@ -564,60 +592,84 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
         arr = m.detach().cpu().numpy() if isinstance(m, torch.Tensor) else np.asarray(m)
         return np.any(np.isnan(arr))
 
-    def normalize(traj):
-        m4x4 = [None if is_nan_cam(m) else to_4x4(m) for m in traj]
-        # find first valid frame to use as reference
-        ref = next((m for m in m4x4 if m is not None), None)
-        if ref is None:
-            return [None] * len(traj)
-        ref_inv = np.linalg.inv(ref)
-        return [None if m is None else m @ ref_inv for m in m4x4]
+    m4x4_alg = [None if is_nan_cam(m) else to_4x4(m) for m in cam_lists]
+    m4x4_gt  = [None if is_nan_cam(m) else to_4x4(m) for m in gt_lists]
 
-    rel_alg = normalize(cam_lists)
-    rel_gt  = normalize(gt_lists)
+    # Extract translation centres from valid frames only
+    valid_idx = [i for i in range(len(m4x4_alg))
+                 if m4x4_alg[i] is not None and m4x4_gt[i] is not None]
 
-    #print([np.linalg.det(cam[:3,:3]) if cam is not None else float('nan') for cam in rel_alg])
+    # Camera centre in world = -R^T t  (since P = [R|t], centre = -R^{-1} t)
+    def cam_centre(m4):
+        R, t = m4[:3, :3], m4[:3, 3]
+        return -R.T @ t
 
-    rot_errors  = []
-    dir_errors  = []
-    norms_alg   = []
-    norms_gt    = []
+    src_pts = np.stack([cam_centre(m4x4_alg[i]) for i in valid_idx])  # (N,3)
+    dst_pts = np.stack([cam_centre(m4x4_gt[i])  for i in valid_idx])  # (N,3)
 
-    for i in range(1, len(rel_alg)):
-        if rel_alg[i] is None or rel_gt[i] is None:
+    R_align, t_align, s_align = umeyama_alignment(src_pts, dst_pts, with_scale)
+
+    # Build 4x4 Sim(3) transform that maps alg world -> gt world
+    T_align = np.eye(4)
+    T_align[:3, :3] = s_align * R_align
+    T_align[:3,  3] = t_align
+
+    rot_errors = []
+    dir_errors = []
+    norms_alg  = []
+    norms_gt   = []
+
+    # Use first valid frame as common reference (after alignment)
+    ref_i = valid_idx[0]
+
+    def relative_to_ref(m4_list, ref_idx):
+        ref_inv = np.linalg.inv(m4_list[ref_idx])
+        return [None if m is None else m @ ref_inv for m in m4_list]
+
+    # Align alg cameras into gt coordinate frame
+    T_align_inv = np.linalg.inv(T_align)
+    m4x4_alg_aligned = [None if m is None else m @ T_align_inv for m in m4x4_alg]
+
+
+    rel_alg = relative_to_ref(m4x4_alg_aligned, ref_i)
+    rel_gt  = relative_to_ref(m4x4_gt,          ref_i)
+
+    for i in range(len(rel_alg)):
+        if i == ref_i or rel_alg[i] is None or rel_gt[i] is None:
             rot_errors.append(np.nan)
             dir_errors.append(np.nan)
             norms_alg.append(np.nan)
             norms_gt.append(np.nan)
             continue
 
-        # --- Rotation Error ---
-        R_alg = rel_alg[i][:3, :3]
+        R_alg = rel_alg[i][:3, :3]        
         R_gt  = rel_gt[i][:3, :3]
 
-        R_diff    = R_alg @ R_gt.T
+        # Remove scale from R_alg before computing rotation error
+        s_r = np.cbrt(np.linalg.det(R_alg))
+        R_alg_pure = R_alg / s_r
+
+        R_diff    = R_alg_pure @ R_gt.T
         trace_val = (np.trace(R_diff) - 1) / 2.0
-        #print(trace_val)
+
+        if trace_val > 1.0:
+            trace_val = trace_val - (trace_val - 1.0)*2  # Correct for numerical issues
+
+
         rot_err   = np.degrees(np.arccos(np.clip(trace_val, -1.0, 1.0)))
         rot_errors.append(rot_err)
 
-        # --- Translation ---
-        t_alg    = rel_alg[i][:3, 3]
-        t_gt     = rel_gt[i][:3, 3]
-        #print("t_alg", t_alg)
-        #print("t_gt", t_gt)
+        t_alg  = rel_alg[i][:3, 3]
+        t_gt   = rel_gt[i][:3, 3]
         norm_alg = np.linalg.norm(t_alg)
         norm_gt  = np.linalg.norm(t_gt)
-
         norms_alg.append(norm_alg)
         norms_gt.append(norm_gt)
 
         if norm_alg < min_t_mag or norm_gt < min_t_mag:
             dir_errors.append(np.nan)
         else:
-            unit_alg = t_alg / norm_alg
-            unit_gt  = t_gt  / norm_gt
-            dot      = np.dot(unit_alg, unit_gt)
+            dot = np.dot(t_alg / norm_alg, t_gt / norm_gt)
             dir_errors.append(np.degrees(np.arccos(np.clip(dot, -1.0, 1.0))))
 
     return {
@@ -625,6 +677,5 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01):
         "mean_dir":  np.nanmean(dir_errors),
         "rot_list":  rot_errors,
         "dir_list":  dir_errors,
-        "norm_alg":  norms_alg,
-        "norm_gt":   norms_gt,
+        "s_align":   s_align,     # useful diagnostic
     }

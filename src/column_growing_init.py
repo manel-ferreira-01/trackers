@@ -72,9 +72,9 @@ def column_growing_init(
     anchor_cols = col_order[:K]
 
     frame_obs_anchor = mask_w[0::3][:, anchor_cols].sum(dim=1)
-    print(f"[column_growing_init] anchor: K={K}/{P} cols "
-          f"| frame obs {frame_obs_anchor.min().item()}..{frame_obs_anchor.max().item()} "
-          f"| density={mask_w[:, anchor_cols].float().mean():.3f}")
+    #print(f"[column_growing_init] anchor: K={K}/{P} cols "
+    #      f"| frame obs {frame_obs_anchor.min().item()}..{frame_obs_anchor.max().item()} "
+    #      f"| density={mask_w[:, anchor_cols].float().mean():.3f}")
 
     # --- 3. ALS on the dense anchor sub-problem ---
     W_anc    = W_obs[:, anchor_cols]
@@ -98,7 +98,7 @@ def column_growing_init(
 
     with torch.no_grad():
         diff = (U @ V_anc.T - W_anc)[mask_anc.bool()]
-        print(f"[column_growing_init] anchor RMSE={((diff**2).mean().sqrt().item()):.5f}")
+        #print(f"[column_growing_init] anchor RMSE={((diff**2).mean().sqrt().item()):.5f}")
 
     # --- 4. Single global V-solve from the anchor U (gauge-consistent) ---
     mask_f = mask_w.float()
@@ -108,6 +108,6 @@ def column_growing_init(
 
     with torch.no_grad():
         diff_full = (U @ V.T - W_obs)[mask_w]
-        print(f"[column_growing_init] full RMSE after V-solve={((diff_full**2).mean().sqrt().item()):.5f}")
+        #print(f"[column_growing_init] full RMSE after V-solve={((diff_full**2).mean().sqrt().item()):.5f}")
 
     return U, V

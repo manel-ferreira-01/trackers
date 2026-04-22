@@ -219,7 +219,6 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
         U, V = column_growing_init(W_init_z, mask_w, rank=rank, ridge=ridge)
         M = U @ V.T
 
-
     prev_rho = float('inf')
 
     for it in range(iters):

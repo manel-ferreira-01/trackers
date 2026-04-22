@@ -9,45 +9,31 @@ import torch
 import k3d
 
 def get_orthogonal_camera_vectors(P):
-    """
-    Decomposes P = K[R|t] to find the true orthogonal rotation R.
-    """
     if torch.is_tensor(P):
         P = P.detach().cpu().numpy()
-    
-    # 1. Handle 2x4 (Affine) vs 3x4 (Projective)
+
     if P.shape[0] == 2:
-        M = np.vstack([P[:, :3], [0, 0, 0]]) # Pad to 3x3
-        t = np.vstack([P[:, 3:], [1]])      # Pad to 3x1
+        M = np.vstack([P[:, :3], [0, 0, 0]])
+        t = np.vstack([P[:, 3:], [1]])
     else:
         M = P[:3, :3]
         t = P[:3, 3:]
 
-    # 2. Extract Camera Center
+    # Camera center
     try:
         C = (-np.linalg.inv(M) @ t).flatten()
     except np.linalg.LinAlgError:
-        C = np.array([0,0,0])
+        C = np.zeros(3)
 
-    # 3. RQ Decomposition to isolate pure Rotation (R) from Intrinsics (K)
-    # Using the flip-QR-flip trick
-    M_flipped = np.flipud(M).T
-    Q_q, R_r = np.linalg.qr(M_flipped)
-    
-    R_ortho = np.flipud(Q_q.T)
-    
-    # Ensure a right-handed system (det == 1)
-    if np.linalg.det(R_ortho) < 0:
-        R_ortho *= 1
+    # Sign convention: det(M) < 0 means mirrored camera
+    sign = 1.0 if np.linalg.det(M) > 0 else -1.0
 
-    # 4. Extract Orthogonal Axes
-    # Row 0 = Right, Row 1 = Up (inverted for screen space), Row 2 = Forward
-    right = R_ortho[0, :]
-    up = -R_ortho[1, :] 
-    forward = R_ortho[2, :]
-    
+    right   =  sign * M[0, :] / np.linalg.norm(M[0, :])
+    up      = -sign * M[1, :] / np.linalg.norm(M[1, :])
+    forward =  sign * M[2, :] / np.linalg.norm(M[2, :])
+
     return C, right, up, forward
-
+    
 def k3d_3d_plot(point_input, color_input=None, camera_input=None, scale=70):
     plot = k3d.plot(camera_auto_fit=True)
 

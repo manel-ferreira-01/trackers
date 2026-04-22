@@ -113,7 +113,7 @@ def run_projective_reconstruction(
         #f_corr = (sigmas2[:, :2].mean(dim=1) / sigmas2[:, 2]).mean()   # (F,) per-frame
         #W_corr[0::3] /= f_corr
         #W_corr[1::3] /= f_corr
-        print(sigmas)
+        #print(sigmas)
         #print(f"  iter {i+1}: scales={current_scales}  f_corr={f_corr}")
 
     # --- Final matrices ---
