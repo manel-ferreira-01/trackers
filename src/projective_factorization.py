@@ -581,7 +581,7 @@ def umeyama_alignment(src_pts, dst_pts, with_scale=True):
     return R, t, s
 
 
-def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=True):
+def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=False):
 
     def to_4x4(m):
         if isinstance(m, torch.Tensor):
@@ -652,8 +652,8 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=Tru
         R_diff    = R_alg_pure @ R_gt.T
         trace_val = (np.trace(R_diff) - 1) / 2.0
 
-        if trace_val > 1.0:
-            trace_val = trace_val - (trace_val - 1.0)*2  # Correct for numerical issues
+        #if trace_val > 1.0:
+        #    trace_val = trace_val - (trace_val - 1.0)*2  # Correct for numerical issues
 
 
         rot_err   = np.degrees(np.arccos(np.clip(trace_val, -1.0, 1.0)))

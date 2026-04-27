@@ -155,7 +155,7 @@ def incremental_matrix_completion(
     return U @ V.T, torch.tensor(error_list)
 
 
-def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ridge=1e-3,
+def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ridge=1e-10,
                               offset_mode="normalize", removal_iters=(10, 20, 30, 40),
                               min_obs=2):
     """
@@ -397,7 +397,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-6, ri
     o_full[best_frames] = o
 
     # ---- Diagnostics ----
-    if 1:
+    if 0:
         import matplotlib.pyplot as plt
 
         if offset_history:
@@ -491,7 +491,7 @@ def filter_visibility(tracks, lam, mask, rank=4):
         valid_frames[valid_frames.clone()] = new_vf
         valid_points[valid_points.clone()] = new_vp
 
-    print(f"After filtering: F={mask_F.shape[0]}, P={mask_F.shape[1]}")
+    #print(f"After filtering: F={mask_F.shape[0]}, P={mask_F.shape[1]}")
     return tracks, lam, mask_F.repeat_interleave(3, dim=0), valid_frames, valid_points
 
 

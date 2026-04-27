@@ -59,10 +59,10 @@ def run_projective_reconstruction(
         W_mat_nan, lambda_mat_nan,
         (~mask).repeat_interleave(3, dim=0), rank=rank,
     )
-    check_visibility(mask_f[0::3])
+    #check_visibility(mask_f[0::3])
 
     nan_pct = (1 - mask_f.float().mean()) * 100
-    print(f"NaNs after filter_visibility: {nan_pct:.2f}%")
+    #print(f"NaNs after filter_visibility: {nan_pct:.2f}%")
 
     # --- Matrix completion ---
     surviving_frames = torch.ones(tracks_f.shape[0] // 3, dtype=torch.bool, device=tracks_f.device)
@@ -122,7 +122,7 @@ def run_projective_reconstruction(
     final_W   = final_W_lam / final_lam.repeat_interleave(3, dim=0)
     final_M = M  / current_scales.repeat_interleave(3)[:, None]
 
-    print("final_scales", current_scales)
+    #print("final_scales", current_scales)
 
     motion, shape, tvec, sing_vals = projective_factorization_fast(final_W_lam)
 
