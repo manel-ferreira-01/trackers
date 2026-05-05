@@ -14,9 +14,16 @@ decord.bridge.set_bridge('torch')
 
 import torch.nn.functional as F
 
+def natural_sort_key(s):
+    import re
+    # Splits the string into a list of strings and integers
+    # e.g., "crop_yaw10" -> ["crop_yaw", 10]
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split('([0-9]+)', s)]
+
 def read_video_or_images(path, mode="crop", device='cpu', target_size=518):
     if os.path.isdir(path):
-        image_files = sorted(glob(os.path.join(path, "*")), key=lambda x: os.path.basename(x))
+        image_files = sorted(glob(os.path.join(path, "*")), key=lambda x: natural_sort_key(os.path.basename(x)))
 
         # Pass 1: get max dims without storing tensors
         max_h, max_w = 0, 0

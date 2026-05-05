@@ -86,7 +86,7 @@ def k3d_3d_plot(point_input, color_input=None, camera_input=None, scale=70):
             camera_input = [camera_input]
 
         N = len(camera_input)
-        cam_size = global_extent * 0.12
+        cam_size = global_extent * 0.02
         dist = cam_size
         w, h = cam_size * 0.8, cam_size * 0.6
         a_len = cam_size * 0.4

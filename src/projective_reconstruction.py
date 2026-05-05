@@ -3,6 +3,7 @@ from src.mat_compl import calibrate_with_completion, filter_visibility, check_vi
 from src.projective_factorization import projective_factorization_fast
 from auxiliar.depth_tensor_viz import k3d_3d_plot
 from src.manel_test_code import projective_joint_imputation
+import matplotlib.pyplot as plt
 
 def run_projective_reconstruction(
     W_mat: torch.Tensor,
@@ -57,9 +58,12 @@ def run_projective_reconstruction(
     # --- Filter visibility ---
     tracks_f, lam_f, mask_f, vf, vp = filter_visibility(
         W_mat_nan, lambda_mat_nan,
-        (~mask).repeat_interleave(3, dim=0), rank=rank,
+        (~mask).repeat_interleave(3, dim=0), rank=2,
     )
-    #check_visibility(mask_f[0::3])
+    check_visibility(mask_f[0::3], rank=2)
+
+    #plt.imshow(mask_f[0::3].cpu(), aspect='auto', interpolation='none')
+    #plt.show()
 
     nan_pct = (1 - mask_f.float().mean()) * 100
     #print(f"NaNs after filter_visibility: {nan_pct:.2f}%")
@@ -122,9 +126,43 @@ def run_projective_reconstruction(
     final_W   = final_W_lam / final_lam.repeat_interleave(3, dim=0)
     final_M = M  / current_scales.repeat_interleave(3)[:, None]
 
-    #print("final_scales", current_scales)
+    print("final_scales", current_scales)
 
     motion, shape, tvec, sing_vals = projective_factorization_fast(final_W_lam)
+    F_frames = motion.shape[0] // 3
+    P_pts    = shape.shape[1]
+
+    # Full reprojection: (3F, P)
+    W_reproj = motion @ shape + tvec  # (3F, P)
+
+    # Projective depths: third row of each frame block
+    lam_reproj = W_reproj[2::3]  # (F, P)
+
+    # Step 1: fix point signs using frame 0
+    obs0 = mask_f[0].bool()  # (P,) bool — observed in frame 0
+    lam0 = lam_reproj[0]  # (P,)
+    point_sign = torch.ones(P_pts, device=motion.device)
+    point_sign[obs0 & (lam0 < 0)] = -1.0
+    shape = shape * point_sign.unsqueeze(0)
+    W_reproj = motion @ shape + tvec  # recompute after point flip
+    lam_reproj = W_reproj[2::3]
+
+    # Step 2: fix each camera sign by majority vote over observed points
+    for f in range(F_frames):
+        obs_f = mask_f[f * 3].bool()  # (P,) bool
+        if obs_f.sum() == 0:
+            continue
+        wf = lam_reproj[f]
+        pos = (wf[obs_f] > 0).sum()
+        neg = (wf[obs_f] < 0).sum()
+        if neg > pos:
+            motion[f*3:f*3+3] *= -1
+            tvec[f*3:f*3+3]   *= -1
+            lam_reproj[f]      *= -1
+
+
+
+    print([torch.linalg.det(motion[i*3:(i+1)*3]) for i in range(motion.shape[0] // 3)])
 
     # --- Build camera list aligned to first camera ---
     R1_inv = motion[:3, :3].t()

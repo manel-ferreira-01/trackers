@@ -677,5 +677,7 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=Fal
         "mean_dir":  np.nanmean(dir_errors),
         "rot_list":  rot_errors,
         "dir_list":  dir_errors,
+        "norm_alg":  norms_alg,   # (F-1,) one per relative frame
+        "norm_gt":   norms_gt,
         "s_align":   s_align,     # useful diagnostic
     }
