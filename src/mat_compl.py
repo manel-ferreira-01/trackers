@@ -167,7 +167,7 @@ def ransac_subspace(W_filled, mask_w, rank=4, n_iters=100,
     if threshold is None:
         # set threshold as median absolute column norm * factor
         col_norms = W_filled.norm(dim=0)  # (P,)
-        threshold = col_norms.median() * 0.01
+        threshold = col_norms.median() * 0.005
 
     best_inliers = torch.zeros(P, dtype=torch.bool, device=device)
     best_count = 0
@@ -505,7 +505,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-4, ri
     o_full[best_frames] = o
 
     # ---- Diagnostics ----
-    if 1:
+    if 0:
         import matplotlib.pyplot as plt
 
         if offset_history:

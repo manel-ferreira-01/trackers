@@ -652,8 +652,8 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=Fal
         R_diff    = R_alg_pure @ R_gt.T
         trace_val = (np.trace(R_diff) - 1) / 2.0
 
-        #if trace_val > 1.0:
-        #    trace_val = trace_val - (trace_val - 1.0)*2  # Correct for numerical issues
+        if trace_val > 1.0:
+            trace_val = trace_val - (trace_val - 1.0)*2  # Correct for numerical issues
 
 
         rot_err   = np.degrees(np.arccos(np.clip(trace_val, -1.0, 1.0)))

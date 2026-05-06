@@ -14,7 +14,23 @@ import matplotlib.patheffects as pe
 import numpy as np
 
 _MATCHER_CACHE = {}
+import sys
+sys.path.append("/home/manuelf/tapnet")
+from tapnet.tapnext.tapnext_torch import TAPNext
+from tapnet.tapnext.tapnext_torch_utils import restore_model_from_jax_checkpoint
 
+def init_tapnext(device):
+
+  tapnext = TAPNext(image_size=(256, 256)).to(device)
+
+  #set model to eval, not backprop
+  tapnext.eval()
+  for p in tapnext.parameters():
+    p.requires_grad = False
+
+  tapnext = restore_model_from_jax_checkpoint(tapnext, "/home/manuelf/tapnet/tapnet/tapnext/bootstapnext_ckpt.npz")
+
+  return tapnext
 def _get_matcher(device='cuda'):
     if 'models' not in _MATCHER_CACHE:
         _MATCHER_CACHE['models'] = {
@@ -123,7 +139,7 @@ def build_combinatory_observation_matrix(video_tensor, device='cuda', window_siz
     print(f"Built {num_tracks} unique tracks from {num_frames} frames (window={window_size}).")
     return W
 
-from src.tapnext_infer import run_tapnext, init_alltracker
+from src.tapnext_infer import run_tapnext, init_alltracker, run_tapnext_growing
 from src.new_queries import add_new_tracks
 from auxiliar.read_video import resize_to_max_side
 import utils.saveload
@@ -136,7 +152,8 @@ import sys
 
 def track_video(video_tensor, query_points_initial,
                 mode="trackon2",
-                device='cpu'):
+                device='cpu',
+                step=80):
     
     match mode:
 
@@ -203,7 +220,7 @@ def track_video(video_tensor, query_points_initial,
         # ==============================================================
         case "tapnext":
             
-            tapnext = init_tapnext(device, "/home/manuelf/storage/bootstapnext_ckpt.npz")
+            tapnext = init_tapnext(device)
             print("Model initialized")
 
             video_permuted = video_tensor.clone().permute(0, 4, 1, 2, 3) 
@@ -221,21 +238,24 @@ def track_video(video_tensor, query_points_initial,
             query_points_tapnext = query_points_initial.clone()
             query_points_tapnext[0, :, 1:3] /= torch.tensor([video_tensor.shape[3] / final_video.shape[3], video_tensor.shape[2] / final_video.shape[2]]).to(device) # 1, N, 3(frames,x,y)
 
-            track_histories = run_tapnext(
+            track_histories = run_tapnext_growing(
                 final_video.to(device),  # send the video resized to the model size
                 query_points_tapnext,
                 tapnext,
                 device=device,
-                new_tracks_flag=False,  # or None
+                #new_tracks_flag=True,  # or None
             )
+            print(track_histories)
             output = {}
 
-            for track_id, trajectory in tqdm(track_histories.items()):  # per feature
+            for track_id, trajectory in tqdm(track_histories.items()):
+                traj_dict = dict(trajectory)   # frame -> pos or None
                 coords = []
-                for t in range(num_frames):  # per frame
-                    step = next((pos for (frame, pos) in trajectory if frame == t), None)
-                    coords.append(step if step is not None else torch.tensor([float('nan'), float('nan')]))
-                output[track_id] = torch.stack(coords)  # shape: [num_frames, 2]
+                for t in range(final_video.shape[1]):
+                    pos = traj_dict.get(t, None)
+                    coords.append(pos if pos is not None else torch.tensor([float('nan'), float('nan')]))
+                output[track_id] = torch.stack(coords)
+
 
             output_list = [trajectory.unsqueeze(0) for _, trajectory in output.items()]
             output_tensor = torch.cat(output_list, dim=0).unsqueeze(0).permute(0, 2, 1, 3)  # [1, num_frames, num_feats, 2]
@@ -256,7 +276,7 @@ def track_video(video_tensor, query_points_initial,
             pred_tracks, pred_visibility = cotracker(
                 video_tensor.squeeze().permute(0, 3, 1, 2).unsqueeze(0).float().to(device),
                 grid_size=step,
-                thr=0.9,
+                thr=0.6,
             )  # B T N 2,  B T N 1
 
             pred_tracks = pred_tracks.cpu()
@@ -295,10 +315,10 @@ def track_video(video_tensor, query_points_initial,
         obs_mat_full[frame*2+1, :] = output_tensor[0, frame, :, 1]  # y
 
     # remove columns (features) that have any NaN values
-    valid_columns_mask_no_nan = ~torch.isnan(obs_mat_full).any(dim=0)
-    obs_mat = obs_mat_full[:, valid_columns_mask_no_nan]
+    #valid_columns_mask_no_nan = ~torch.isnan(obs_mat_full).any(dim=0)
+    #obs_mat = obs_mat_full[:, valid_columns_mask_no_nan]
 
-    return obs_mat
+    return obs_mat_full
 
 
 def view_matches(video_tensor, obs_mat):

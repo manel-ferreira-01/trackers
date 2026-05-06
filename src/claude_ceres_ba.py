@@ -90,6 +90,8 @@ def run_bundle_adjustment_ceres(rotations, translations, points_3d, points_2d, K
 
     for cam_idx, (rvec, tvec, pts2d) in enumerate(zip(rvecs, tvecs, points_2d)):
         for pt_idx, obs in enumerate(pts2d):
+            if not np.isfinite(obs).all():
+                continue
             cost = ReprojectionError(obs[0], obs[1], K)
             problem.add_residual_block(
                 cost,

@@ -37,7 +37,7 @@ def plot_matrix_blocks(
     if ax is None:
         fig_w = max(10, P / 30)
         fig_h = max(4,  F / 8)
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        fig, ax = plt.subplots()#figsize=(fig_w, fig_h))
     else:
         fig = ax.figure
 

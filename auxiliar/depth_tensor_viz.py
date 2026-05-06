@@ -131,7 +131,7 @@ def k3d_3d_plot(point_input, color_input=None, camera_input=None, scale=70):
         plot += k3d.lines(
             all_verts,
             all_inds,
-            color=0xff0000,
+            color=0x00ff00,
             width=float(cam_size * 0.02),
             shader="simple"
         )

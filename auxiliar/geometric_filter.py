@@ -80,17 +80,44 @@ def _sym_transfer(H, p1, p2):
     return d1 + d2
 
 
+try:
+    import cv2 as _cv2
+    _HAVE_CV2 = True
+except ImportError:
+    _HAVE_CV2 = False
+
+
 def _ransac(p1, p2, mode, thresh, max_iters=500):
-    """Simple RANSAC loop.  Returns (N,) bool inlier mask."""
+    """RANSAC via OpenCV (fast C++) with numpy fallback.  Returns (N,) bool inlier mask."""
     N       = len(p1)
     min_pts = 4 if mode == 'H' else 8
     if N < min_pts:
         return np.zeros(N, dtype=bool)
 
+    if _HAVE_CV2:
+        p1f = p1.astype(np.float32)
+        p2f = p2.astype(np.float32)
+        if mode == 'H':
+            _, mask = _cv2.findHomography(p1f, p2f, _cv2.RANSAC,
+                                          thresh, maxIters=max_iters,
+                                          confidence=0.99)
+        else:
+            _, mask = _cv2.findFundamentalMat(p1f, p2f, _cv2.FM_RANSAC,
+                                              thresh, 0.99, max_iters)
+        if mask is None:
+            return np.zeros(N, dtype=bool)
+        return mask.ravel().astype(bool)
+
+    # --- pure-numpy fallback ---
+    thresh2  = thresh ** 2
     best_inl = np.zeros(N, dtype=bool)
     best_cnt = 0
+    log_conf = np.log(1 - 0.99)
+    adaptive_iters = max_iters
+    it = 0
 
-    for _ in range(max_iters):
+    while it < adaptive_iters:
+        it += 1
         idx = np.random.choice(N, min_pts, replace=False)
         try:
             if mode == 'H':
@@ -102,13 +129,17 @@ def _ransac(p1, p2, mode, thresh, max_iters=500):
         except np.linalg.LinAlgError:
             continue
 
-        inl = err < thresh**2
+        inl = err < thresh2
         cnt = inl.sum()
         if cnt > best_cnt:
             best_cnt = cnt
             best_inl = inl
+            inlier_ratio = best_cnt / N
+            if inlier_ratio > 0:
+                denom = np.log(1 - inlier_ratio ** min_pts)
+                if denom < 0:
+                    adaptive_iters = min(adaptive_iters, int(np.ceil(log_conf / denom)))
 
-    # refit on inliers
     if best_cnt >= min_pts:
         try:
             if mode == 'H':
@@ -117,11 +148,34 @@ def _ransac(p1, p2, mode, thresh, max_iters=500):
             else:
                 M   = _fit_F(p1[best_inl], p2[best_inl])
                 err = _sampson(M, p1, p2)
-            best_inl = err < thresh**2
+            best_inl = err < thresh2
         except np.linalg.LinAlgError:
             pass
 
     return best_inl
+
+
+def _process_pair(args):
+    """Worker: run RANSAC for one frame pair. Designed for joblib/multiprocessing."""
+    fi, fj, obs_np, mode, ransac_thresh, max_ransac_iters, min_pair_points = args
+    P = obs_np.shape[1]
+    xs_np = obs_np[0::2]
+
+    valid = (~np.isnan(xs_np[fi])) & (~np.isnan(xs_np[fj]))
+    vi    = np.where(valid)[0]
+    if len(vi) < min_pair_points:
+        return None
+
+    p1 = np.stack([obs_np[2*fi,   vi], obs_np[2*fi+1, vi]], 1).astype(np.float64)
+    p2 = np.stack([obs_np[2*fj,   vi], obs_np[2*fj+1, vi]], 1).astype(np.float64)
+
+    ok    = np.isfinite(p1).all(1) & np.isfinite(p2).all(1)
+    vi_ok = vi[ok]
+    if ok.sum() < min_pair_points:
+        return None
+
+    inl = _ransac(p1[ok], p2[ok], mode, ransac_thresh, max_ransac_iters)
+    return vi_ok, inl, int(ok.sum())
 
 
 def geometric_filter_obs(
@@ -141,7 +195,6 @@ def geometric_filter_obs(
     Parameters
     ----------
     obs_mat           (2F, P)  pixel coords, NaN where missing
-    lambda_mat        (F,  P)  depths, NaN where missing
     K                 (3,3) intrinsics — ignored for F, used to convert F→E
     mode              'H' homography | 'F' fundamental | 'E' essential
     min_vote_fraction point must be inlier in this fraction of testable pairs
@@ -155,20 +208,12 @@ def geometric_filter_obs(
     Returns
     -------
     obs_clean    (2F, P_kept)
-    lam_clean    (F,  P_kept)
     inlier_mask  (P,) bool tensor
     """
     F  = obs_mat.shape[0] // 2
     P  = obs_mat.shape[1]
 
-    K_np = None
-    if K is not None and mode == 'E':
-        K_np = K.float().cpu().numpy()
-        while K_np.ndim > 2:
-            K_np = K_np.squeeze(0)
-
     obs_np = obs_mat.float().cpu().numpy()
-    xs_np  = obs_np[0::2]   # (F, P)
 
     # select pairs
     all_pairs = [(i, j) for i, j in combinations(range(F), 2)
@@ -185,31 +230,25 @@ def geometric_filter_obs(
     inlier_votes = np.zeros(P, dtype=np.int32)
     testable_cnt = np.zeros(P, dtype=np.int32)
 
-    for k, (fi, fj) in enumerate(all_pairs):
-        # co-visible points for this pair
-        valid = (~np.isnan(xs_np[fi])) & (~np.isnan(xs_np[fj]))
-        vi    = np.where(valid)[0]
-        if len(vi) < min_pair_points:
+    args_list = [
+        (fi, fj, obs_np, mode, ransac_thresh, max_ransac_iters, min_pair_points)
+        for fi, fj in all_pairs
+    ]
+
+    results = [_process_pair(a) for a in args_list]
+
+    for k, res in enumerate(results):
+        if res is None:
             continue
-
-        p1 = np.stack([obs_np[2*fi,   vi], obs_np[2*fi+1, vi]], 1).astype(np.float64)
-        p2 = np.stack([obs_np[2*fj,   vi], obs_np[2*fj+1, vi]], 1).astype(np.float64)
-
-        # drop non-finite rows before RANSAC
-        ok   = np.isfinite(p1).all(1) & np.isfinite(p2).all(1)
-        vi_ok = vi[ok]
-        if ok.sum() < min_pair_points:
-            continue
-
-        inl = _ransac(p1[ok], p2[ok], mode, ransac_thresh, max_ransac_iters)
-
+        vi_ok, inl, n_covis = res
         testable_cnt[vi_ok]      += 1
         inlier_votes[vi_ok[inl]] += 1
 
         if verbose and (k+1) % max(1, len(all_pairs)//10) == 0:
+            fi, fj = all_pairs[k]
             pct = (k+1) / len(all_pairs) * 100
             print(f"  {pct:4.0f}%  pair ({fi:2d},{fj:2d})  "
-                  f"co-vis={ok.sum():4d}  inliers={inl.sum():4d}  "
+                  f"co-vis={n_covis:4d}  inliers={inl.sum():4d}  "
                   f"({100*inl.mean():.0f}%)")
 
     # survival rule: inlier in >= fraction of testable pairs
@@ -227,7 +266,7 @@ def geometric_filter_obs(
         print(f"  Kept {n_kept}/{P} ({100*n_kept/P:.1f}%)  |  "
               f"among tested: {100*inlier_mask[tested].mean():.1f}%")
 
-    mask_t    = torch.from_numpy(inlier_mask)
+    mask_t = torch.from_numpy(inlier_mask)
     return obs_mat[:, mask_t], mask_t
 
 
@@ -254,8 +293,8 @@ def build_filtered_inputs(
         inlier_mask  (P_orig,) bool
         obs_clean    (2F, P_kept)
     """
-    obs_c, lam_c, mask = geometric_filter_obs(
-        obs_mat, lambda_mat,
+    obs_c, mask = geometric_filter_obs(
+        obs_mat,
         K=K, mode=mode,
         min_vote_fraction=min_vote_fraction,
         min_inlier_pairs=min_inlier_pairs,
@@ -267,6 +306,7 @@ def build_filtered_inputs(
         verbose=verbose,
     )
 
+    lam_c = lambda_mat[:, mask]
     F  = obs_c.shape[0] // 2
     P  = obs_c.shape[1]
     x  = obs_c[0::2]

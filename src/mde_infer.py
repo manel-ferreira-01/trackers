@@ -46,7 +46,7 @@ def infer_mde(video_tensor, mde_model="moge"):
                 [ 0,  fx, H / 2.0],
                 [ 0,   0,     1.0]
             ], dtype=torch.float32)
-            instrisics_infered = K.unsqueeze(0).repeat(video_tensor.shape[1], 1, 1)
+            #instrisics_infered = K.unsqueeze(0).repeat(video_tensor.shape[1], 1, 1)
             #instrisics_infered[:,0,0] *= 0.75
             #instrisics_infered[:,1,1] *= 0.75
 
@@ -97,7 +97,7 @@ def infer_mde(video_tensor, mde_model="moge"):
 
             model = _MODEL_CACHE["moge"]
             depths, instrisics = [], []
-            for frame in (range(video_tensor.shape[1])):
+            for frame in tqdm(range(video_tensor.shape[1])):
                 pred = model.infer((video_tensor[0, frame].permute(2, 0, 1).to("cuda:0") + 1) / 2.0)
                 depths.append(pred["depth"])
                 instrisics.append(pred["intrinsics"])
@@ -108,7 +108,7 @@ def infer_mde(video_tensor, mde_model="moge"):
             instrisics_infered[:, 0, :] *= video_tensor.shape[3]
 
             H, W = video_tensor.shape[2], video_tensor.shape[3]
-            fov_deg = 90.0
+            fov_deg = 85.0
             fx =  (W / 2.0) / math.tan(math.radians(fov_deg / 2))
             K = torch.tensor([
                 [fx,   0, W / 2.0],

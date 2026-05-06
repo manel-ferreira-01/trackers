@@ -302,6 +302,12 @@ def compute_global_depth_calibration(
             continue
 
         s, o = fit_affine(lam_mde[pos_mask], lam_global[pos_mask])
+
+        lam_pred = s * lam_mde[pos_mask] + o
+        residuals = lam_pred - lam_global[pos_mask]
+        print(f"s={s:.4f}, o={o:.4f}")
+        print(f"fit residual mean={residuals.mean():.4f}, std={residuals.std():.4f}")
+
         global_scales[fi]  = s
         global_offsets[fi] = o
 
