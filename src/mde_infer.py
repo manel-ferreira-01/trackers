@@ -8,7 +8,7 @@ import math
 _MODEL_CACHE = globals().get("_MODEL_CACHE", {})
 _MODEL_CACHE = {}
 
-def infer_mde(video_tensor, mde_model="moge"):
+def infer_mde(video_tensor, mde_model="moge",device="cuda:0"):
 
     match mde_model:
         case "vggt":
@@ -16,7 +16,7 @@ def infer_mde(video_tensor, mde_model="moge"):
             from aux import wrap_value, unwrap_value
             import io
 
-            response = call_vggt(video_tensor.cpu(), device="cuda:0")
+            response = call_vggt(video_tensor.cpu(), device=device)
             depth_infered = torch.tensor(np.load(io.BytesIO(unwrap_value(response.data["depth"]))))
             instrisics_infered = torch.tensor(np.load(io.BytesIO(unwrap_value(response.data["intrinsic"]))))
 
@@ -24,12 +24,12 @@ def infer_mde(video_tensor, mde_model="moge"):
             if "unidepth" not in _MODEL_CACHE:
                 sys.path.append("/home/manuelf/UniDepth/")
                 from unidepth.models import UniDepthV2
-                _MODEL_CACHE["unidepth"] = UniDepthV2.from_pretrained("lpiccinelli/unidepth-v2-vitl14").to("cuda:0")
+                _MODEL_CACHE["unidepth"] = UniDepthV2.from_pretrained("lpiccinelli/unidepth-v2-vitl14").to(device)
             
             model = _MODEL_CACHE["unidepth"]
             depths, uni_conf, uni_focal = [], [], []
             for frame in tqdm(range(video_tensor.shape[1])):
-                pred = model.infer(video_tensor[0, frame].permute(2, 0, 1).to("cuda:0"))
+                pred = model.infer(video_tensor[0, frame].permute(2, 0, 1).to(device))
                 depths.append(pred["depth"])
                 uni_conf.append(1 / pred["confidence"])
                 uni_focal.append(pred["intrinsics"])
@@ -46,7 +46,7 @@ def infer_mde(video_tensor, mde_model="moge"):
                 [ 0,  fx, H / 2.0],
                 [ 0,   0,     1.0]
             ], dtype=torch.float32)
-            #instrisics_infered = K.unsqueeze(0).repeat(video_tensor.shape[1], 1, 1)
+            instrisics_infered = K.unsqueeze(0).repeat(video_tensor.shape[1], 1, 1)
             #instrisics_infered[:,0,0] *= 0.75
             #instrisics_infered[:,1,1] *= 0.75
 
@@ -66,12 +66,12 @@ def infer_mde(video_tensor, mde_model="moge"):
                 }
                 m = DepthAnythingV2(**model_configs[encoder], max_depth=max_depth)
                 m.load_state_dict(torch.load(f'/home/manuelf/Depth-Anything-V2/checkpoints/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
-                _MODEL_CACHE["d-any-v2"] = m.to("cuda:0").eval()
+                _MODEL_CACHE["d-any-v2"] = m.to(device).eval()
 
             model = _MODEL_CACHE["d-any-v2"]
             depths = []
             for frame in tqdm(range(video_tensor.shape[1])):
-                depth = model.infer_image(video_tensor[0, frame].to("cuda:0").cpu().numpy())
+                depth = model.infer_image(video_tensor[0, frame].to(device).cpu().numpy())
                 depths.append(torch.tensor(depth))
 
             depth_infered = (torch.stack(depths).unsqueeze(-1).cpu().squeeze())
@@ -93,12 +93,12 @@ def infer_mde(video_tensor, mde_model="moge"):
             if "moge" not in _MODEL_CACHE:
                 sys.path.append("/home/manuelf/MoGe")
                 from moge.model.v2 import MoGeModel
-                _MODEL_CACHE["moge"] = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to("cuda:0")
+                _MODEL_CACHE["moge"] = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
 
             model = _MODEL_CACHE["moge"]
             depths, instrisics = [], []
             for frame in tqdm(range(video_tensor.shape[1])):
-                pred = model.infer((video_tensor[0, frame].permute(2, 0, 1).to("cuda:0") + 1) / 2.0)
+                pred = model.infer((video_tensor[0, frame].permute(2, 0, 1).to(device) + 1) / 2.0)
                 depths.append(pred["depth"])
                 instrisics.append(pred["intrinsics"])
 

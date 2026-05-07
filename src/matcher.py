@@ -31,6 +31,8 @@ def init_tapnext(device):
   tapnext = restore_model_from_jax_checkpoint(tapnext, "/home/manuelf/tapnet/tapnet/tapnext/bootstapnext_ckpt.npz")
 
   return tapnext
+
+
 def _get_matcher(device='cuda'):
     if 'models' not in _MATCHER_CACHE:
         _MATCHER_CACHE['models'] = {
