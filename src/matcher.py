@@ -141,12 +141,9 @@ def build_combinatory_observation_matrix(video_tensor, device='cuda', window_siz
     print(f"Built {num_tracks} unique tracks from {num_frames} frames (window={window_size}).")
     return W
 
-from src.tapnext_infer import run_tapnext, init_alltracker, run_tapnext_growing
+from src.tapnext_infer import run_tapnext, run_tapnext_growing
 from src.new_queries import add_new_tracks
 from auxiliar.read_video import resize_to_max_side
-import utils.saveload
-import utils.basic
-import utils.improc
 import torch.nn.functional as F
 import sys
 
@@ -221,9 +218,11 @@ def track_video(video_tensor, query_points_initial,
 
         # ==============================================================
         case "tapnext":
-            
-            tapnext = init_tapnext(device)
-            print("Model initialized")
+
+            if "tapnext" not in _MATCHER_CACHE:
+                _MATCHER_CACHE["tapnext"] = init_tapnext(device)
+                print("Model initialized")
+            tapnext = _MATCHER_CACHE["tapnext"]
 
             video_permuted = video_tensor.clone().permute(0, 4, 1, 2, 3) 
             target_frames = video_permuted.shape[2] # Keep frames as 17

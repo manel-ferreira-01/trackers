@@ -9,9 +9,9 @@ from tapnet.tapnext.tapnext_torch import TAPNext,TAPNextTrackingState # type: ig
 from tapnet.tapnext.tapnext_torch_utils import restore_model_from_jax_checkpoint # type: ignore
 
 
-import sys, torch
-sys.path.append("/home/manuelf/alltracker")
-from nets.alltracker import Net
+#import sys, torch
+#sys.path.append("/home/manuelf/alltracker")
+#from nets.alltracker import Net
 
 def init_tapnext(device, model_path):
 
@@ -208,8 +208,8 @@ def run_tapnext_growing(video_tensor, query_points_initial, tapnext, device="cud
                 for gen in generations:
                     tracks_k, _, vis_k, gen['state'] = tapnext(
                         video=frame,
-                        state=gen['state']
-                    )
+                        state=gen['state'])
+                    
                     vis = (vis_k[0, 0] > 0).cpu()  # [N_gen]
                     for i, tid in enumerate(gen['ids']):
                         pos = tracks_k[0, 0, i, :2].cpu()
@@ -221,7 +221,8 @@ def run_tapnext_growing(video_tensor, query_points_initial, tapnext, device="cud
                 if k % 5 == 0:
                     existing_pos = torch.stack(all_visible_positions).to(device) \
                         if all_visible_positions else torch.zeros((0, 2), device=device)
-                    new_queries = detector_fn(frame[0, 0], existing_pos, frame_idx=k)
+                    #new_queries = detector_fn(frame[0, 0], existing_pos, frame_idx=k)
+                    new_queries = None  # disable new tracks for now
 
                     if new_queries is not None and new_queries.shape[0] > 0:
                         N_new = new_queries.shape[0]

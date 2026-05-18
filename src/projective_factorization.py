@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 def sample_depths(depths, tracks):
     """
@@ -581,7 +582,7 @@ def umeyama_alignment(src_pts, dst_pts, with_scale=True):
     return R, t, s
 
 
-def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=False):
+def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=False, gt_shape=None, rec_shape=None):
 
     def to_4x4(m):
         if isinstance(m, torch.Tensor):
@@ -672,6 +673,36 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=Fal
             dot = np.dot(t_alg / norm_alg, t_gt / norm_gt)
             dir_errors.append(np.degrees(np.arccos(np.clip(dot, -1.0, 1.0))))
 
+    shape_err = None
+    if gt_shape is not None and rec_shape is not None:
+        if isinstance(rec_shape, torch.Tensor):
+            rec_shape = rec_shape.detach().cpu().numpy()
+        if isinstance(gt_shape, torch.Tensor):
+            gt_shape = gt_shape.detach().cpu().numpy()
+
+        # Direct Procrustes alignment on points (independent of pose alignment)
+        rec_c = rec_shape - rec_shape.mean(1, keepdims=True)
+        gt_c  = gt_shape  - gt_shape.mean(1, keepdims=True)
+
+        # uniform scale
+        s_shape = np.linalg.norm(gt_c) / (np.linalg.norm(rec_c) + 1e-8)
+        rec_c = rec_c * s_shape
+
+        # rotation
+        U, _, Vt = np.linalg.svd(gt_c @ rec_c.T)
+        R_proc = U @ Vt
+        if np.linalg.det(R_proc) < 0:
+            Vt[-1] *= -1
+            R_proc = U @ Vt
+
+        rec_shape_aligned = R_proc @ rec_c + gt_shape.mean(1, keepdims=True)
+
+        per_point_err = np.linalg.norm(rec_shape_aligned - gt_shape, axis=0)  # (P,)
+        shape_err = float(np.mean(per_point_err))
+
+
+
+
     return {
         "mean_rot":  np.nanmean(rot_errors),
         "mean_dir":  np.nanmean(dir_errors),
@@ -680,4 +711,5 @@ def compare_3x4_trajectories(cam_lists, gt_lists, min_t_mag=0.01, with_scale=Fal
         "norm_alg":  norms_alg,   # (F-1,) one per relative frame
         "norm_gt":   norms_gt,
         "s_align":   s_align,     # useful diagnostic
+        "shape_err": shape_err,
     }

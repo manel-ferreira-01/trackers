@@ -108,7 +108,7 @@ def infer_mde(video_tensor, mde_model="moge",device="cuda:0"):
             instrisics_infered[:, 0, :] *= video_tensor.shape[3]
 
             H, W = video_tensor.shape[2], video_tensor.shape[3]
-            fov_deg = 85.0
+            fov_deg = 55.0
             fx =  (W / 2.0) / math.tan(math.radians(fov_deg / 2))
             K = torch.tensor([
                 [fx,   0, W / 2.0],

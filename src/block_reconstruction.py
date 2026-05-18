@@ -389,6 +389,17 @@ def run_block_reconstruction(
     result["global_scales"]  = global_scales
     result["global_offsets"] = global_offsets
 
+    result["eval"] = evaluate_reconstruction(
+        shape_dict=result["shape_dict"],
+        cam_lists=result["cam_lists"],
+        frame_indices=result["frame_indices"],
+        W_mat=W_mat,
+        lambda_mat=lambda_mat,
+        global_scales=global_scales,
+        global_offsets=global_offsets,
+)
+
+
     print(f"\nAssembly complete: {len(result['cam_lists'])} cameras, "
           f"{len(result['shape_dict'])} points")
 
@@ -411,6 +422,7 @@ def assemble_blocks(blocks: list[BlockResult], min_common: int = 6) -> dict:
         curr = blocks[i]
 
         H = estimate_H(prev, curr, min_points=min_common)
+        print(H)
         if H is None:
             print(f"  Stitching failed at block {i}, skipping block.")
             continue
@@ -452,3 +464,107 @@ def assemble_blocks(blocks: list[BlockResult], min_common: int = 6) -> dict:
         consistency=consistency,
         assembled_blocks=assembled,
     )
+
+def evaluate_reconstruction(
+    shape_dict: dict,               # {global_p: (3,)} from assemble_blocks
+    cam_lists: list,                # list of (3,4), global cameras
+    frame_indices: list[int],       # global frame indices
+    W_mat: torch.Tensor,            # (3F, P) raw
+    lambda_mat: torch.Tensor,       # (F, P) raw MDE
+    global_scales: torch.Tensor,    # (F_surv,)
+    global_offsets: torch.Tensor,   # (F_surv,)
+    S_hom = None,                      # (4, P) optional pre-homogenised shape for reprojection
+) -> dict:
+
+    device = W_mat.device
+    dtype  = W_mat.dtype
+
+    known_ids = sorted(shape_dict.keys())
+    known_ids_t = torch.tensor(known_ids, device=device)
+    if S_hom is None:
+        xyz = torch.stack([shape_dict[p] for p in known_ids], dim=1)          # (3, P_known)
+        S_hom = torch.cat([xyz, torch.ones(1, xyz.shape[1], device=device, dtype=dtype)], dim=0)  # (4, P_known)
+
+    errors_raw, errors_affine = [], []
+
+    for fi, (f, cam) in enumerate(zip(frame_indices, cam_lists)):
+        proj     = cam @ S_hom          # (3, P_known)
+        lam_proj = proj[2]              # (P_known,) projective depth from reconstruction
+
+        # observed points that are also in shape_dict
+        lam_mde_full = lambda_mat[f, known_ids_t]     # (P_known,)
+        obs = torch.isfinite(lam_mde_full) & (lam_proj > 0)
+        if obs.sum() == 0:
+            continue
+
+        w_obs    = W_mat[3*f : 3*f+3, known_ids_t[obs]]   # (3, K)
+        lam_mde  = lam_mde_full[obs]                        # (K,)
+        reproj_f = proj[:, obs]                             # (3, K)  — already W·λ
+
+        # variant 1: raw λ
+        errors_raw.append((w_obs * lam_mde - reproj_f).norm(dim=0))
+
+        # variant 2: affine-corrected λ
+        lam_cal = global_scales[fi] * lam_mde + global_offsets[fi]
+        pos = lam_cal > 0
+        if pos.sum() > 0:
+            errors_affine.append((w_obs[:, pos] * lam_cal[pos] - reproj_f[:, pos]).norm(dim=0))
+
+    errors_raw    = torch.cat(errors_raw)
+    errors_affine = torch.cat(errors_affine)
+
+    print(f"raw λ    — mean: {errors_raw.mean():.4f}  median: {errors_raw.median():.4f}  p95: {errors_raw.quantile(0.95):.4f}")
+    print(f"affine λ — mean: {errors_affine.mean():.4f}  median: {errors_affine.median():.4f}  p95: {errors_affine.quantile(0.95):.4f}")
+
+    return dict(errors_raw=errors_raw, errors_affine=errors_affine)
+
+
+def evaluate_reconstruction_dense(
+    shape: torch.Tensor,             # (3, P_surv) 
+    point_indices: torch.Tensor,     # (P_surv,) global point indices
+    cam_lists: list,                 # list of (3,4), global cameras
+    frame_indices: list[int],        # global frame indices
+    W_mat: torch.Tensor,             # (3F, P) raw
+    lambda_mat: torch.Tensor,        # (F, P) raw MDE
+    global_scales: torch.Tensor,     # (F_surv,)
+    global_offsets: torch.Tensor,    # (F_surv,)
+) -> dict:
+
+    device = W_mat.device
+    dtype  = W_mat.dtype
+
+    S_hom = torch.cat([shape, torch.ones(1, shape.shape[1], device=device, dtype=dtype)], dim=0)  # (4, P_surv)
+
+    errors_raw, errors_affine = [], []
+
+    for fi, (f, cam) in enumerate(zip(frame_indices, cam_lists)):
+            proj     = cam @ S_hom                                  # (3, P_surv)
+            lam_proj = proj[2]                                      # (P_surv,)
+
+            lam_mde_full = lambda_mat[f, point_indices]             # (P_surv,)
+            obs = torch.isfinite(lam_mde_full) & (lam_proj > 0)
+            if obs.sum() == 0:
+                continue
+
+            w_obs    = W_mat[3*f : 3*f+3, point_indices[obs]]      # (3, K)
+            lam_mde  = lam_mde_full[obs]                            # (K,)
+            reproj_f = proj[:, obs]                                 # (3, K)
+
+            # perspective division -> 2D normalized coords
+            x_proj = reproj_f[:2] / reproj_f[2]                    # (2, K)
+            x_obs  = w_obs[:2] / w_obs[2]                          # (2, K) — w already normalized, w[2]=1
+
+            errors_raw.append((x_obs - x_proj).norm(dim=0))
+
+            lam_cal = global_scales[fi] * lam_mde + global_offsets[fi]
+            pos = lam_cal > 0
+            if pos.sum() > 0:
+                errors_affine.append((x_obs[:, pos] - x_proj[:, pos]).norm(dim=0))
+
+    errors_raw    = torch.cat(errors_raw)
+    errors_affine = torch.cat(errors_affine)
+
+    print(f"raw λ    — mean: {errors_raw.mean():.4f}  median: {errors_raw.median():.4f}  p95: {errors_raw.quantile(0.95):.4f}")
+    print(f"affine λ — mean: {errors_affine.mean():.4f}  median: {errors_affine.median():.4f}  p95: {errors_affine.quantile(0.95):.4f}")
+
+    return dict(errors_raw=errors_raw, errors_affine=errors_affine)

@@ -132,34 +132,6 @@ def run_projective_reconstruction(
     F_frames = motion.shape[0] // 3
     P_pts    = shape.shape[1]
 
-    # Full reprojection: (3F, P)
-    W_reproj = motion @ shape + tvec  # (3F, P)
-
-    # Projective depths: third row of each frame block
-    lam_reproj = W_reproj[2::3]  # (F, P)
-
-    # Step 1: fix point signs using frame 0
-    obs0 = mask_f[0].bool()  # (P,) bool — observed in frame 0
-    lam0 = lam_reproj[0]  # (P,)
-    point_sign = torch.ones(P_pts, device=motion.device)
-    point_sign[obs0 & (lam0 < 0)] = -1.0
-    shape = shape * point_sign.unsqueeze(0)
-    W_reproj = motion @ shape + tvec  # recompute after point flip
-    lam_reproj = W_reproj[2::3]
-
-    # Step 2: fix each camera sign by majority vote over observed points
-    for f in range(F_frames):
-        obs_f = mask_f[f * 3].bool()  # (P,) bool
-        if obs_f.sum() == 0:
-            continue
-        wf = lam_reproj[f]
-        pos = (wf[obs_f] > 0).sum()
-        neg = (wf[obs_f] < 0).sum()
-        if neg > pos:
-            motion[f*3:f*3+3] *= -1
-            tvec[f*3:f*3+3]   *= -1
-            lam_reproj[f]      *= -1
-
 
 
     print([torch.linalg.det(motion[i*3:(i+1)*3]) for i in range(motion.shape[0] // 3)])
