@@ -16,6 +16,7 @@ def run_projective_reconstruction(
     removal_iters: tuple = (10, 20, 30, 40),
     plot: bool = True,
     min_obs: int = 2,
+    init_M=None,
 ) -> dict:
     """
     Full projective reconstruction pipeline: filter visibility, complete the
@@ -62,6 +63,11 @@ def run_projective_reconstruction(
     )
     check_visibility(mask_f[0::3], rank=2)
 
+    # slice init_M to surviving frames/points after filter_visibility
+    init_M_f = None
+    if init_M is not None:
+        init_M_f = init_M[vf.repeat_interleave(3)][:, vp]
+
     #plt.imshow(mask_f[0::3].cpu(), aspect='auto', interpolation='none')
     #plt.show()
 
@@ -75,7 +81,7 @@ def run_projective_reconstruction(
     if 1:
         o, compl_W_lam, M, mask_f, surviving_frames, surviving_cols = calibrate_with_completion(
             tracks_f, lam_f, mask_f, iters=iters, offset_mode=offset_mode, removal_iters=removal_iters,
-            min_obs=min_obs)
+            min_obs=min_obs, init_M=init_M_f)
     else:
         compl_W_lam, _, o, _, _ = projective_joint_imputation(
             tracks_f, lam_f, mask_f,

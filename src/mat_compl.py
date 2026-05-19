@@ -167,7 +167,7 @@ def ransac_subspace(W_filled, mask_w, rank=4, n_iters=100,
     if threshold is None:
         # set threshold as median absolute column norm * factor
         col_norms = W_filled.norm(dim=0)  # (P,)
-        threshold = col_norms.median() * 0.005
+        threshold = col_norms.median() * 0.01
 
     best_inliers = torch.zeros(P, dtype=torch.bool, device=device)
     best_count = 0
@@ -197,7 +197,8 @@ def ransac_subspace(W_filled, mask_w, rank=4, n_iters=100,
 
 def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-4, ridge=1e-10,
                               offset_mode="normalize", removal_iters=(10, 20, 30, 40),
-                              min_obs=2, completion="als", svt_tau=500, svt_step=1.0):
+                              min_obs=2, completion="als", svt_tau=500, svt_step=1.0,
+                              init_M = None):
     """
     Jointly estimates per-frame affine depth calibration (scale + offset)
     and completes missing entries, such that (d*lam + o) * tracks is rank-4.
@@ -249,7 +250,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-4, ri
     W_init_z = torch.where(mask_w, W_init, torch.zeros_like(W_init))  # zeros for missing
 
 
-    if 1:
+    if 0:
         col_mean = torch.nanmean(W_init, dim=0)
         W_filled = torch.where(mask_w, W_init, col_mean.unsqueeze(0).expand_as(W_init))
         Ui, Si, Vhi = torch.linalg.svd(W_filled, full_matrices=False)
@@ -257,9 +258,25 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-4, ri
         V = (Vhi[:rank].T * Si[:rank].sqrt()).contiguous()
         M = U @ V.T
 
-    else:
+    if 0:
         U, V = column_growing_init(W_init_z, mask_w, rank=rank, ridge=ridge)
         M = U @ V.T
+
+    if init_M is not None:
+        col_mean = torch.nanmean(W_init, dim=0)
+        # use init_M where valid, fall back to col_mean where NaN
+        init_M_clean = init_M.clone()
+        nan_mask = torch.isnan(init_M_clean)
+        init_M_clean[nan_mask] = col_mean.unsqueeze(0).expand_as(init_M_clean)[nan_mask]
+        # observed entries should always use the actual W_init
+        init_M_clean = torch.where(mask_w, W_init, init_M_clean)
+        
+        Ui, Si, Vhi = torch.linalg.svd(init_M_clean, full_matrices=False)
+        U = (Ui[:, :rank] * Si[:rank].sqrt()).contiguous()
+        V = (Vhi[:rank].T  * Si[:rank].sqrt()).contiguous()
+        M = U @ V.T
+
+
 
     prev_rho = float('inf')
     Y_svt = torch.zeros_like(M)   # SVT dual variable (persistent across iters)
@@ -278,80 +295,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-4, ri
 
         # ---- Outlier removal at fixed iterations ----
         if removal_iters and it in removal_iters:
-
-            if 0:
-                res_A = (W_filled - M) ** 2
-                # --- Option B: project W_filled onto V subspace ---
-                Qv    = torch.linalg.svd(V, full_matrices=False)[0]   # (P_w, rank)
-                W_proj_V = (W_filled @ Qv) @ Qv.T
-                res_B = (W_filled - W_proj_V) ** 2
-
-                # --- Option C: project W_filled onto U subspace ---
-                Qu    = torch.linalg.svd(U, full_matrices=False)[0]   # (3F_w, rank)
-                W_proj_U = Qu @ (Qu.T @ W_filled)
-                res_C = (W_filled - W_proj_U) ** 2
-
-                # --- Switch here ---
-                cell_res    = res_A   # <-- swap to res_B or res_C to test
-                cell_res_fp = cell_res.reshape(F_w, 3, P_w).max(dim=1).values
-
-                #threshold   = torch.quantile(cell_res_fp, 0.9)
-                #bad_fp      = cell_res_fp > threshold
-                threshold = torch.quantile(cell_res_fp, 0.90)
-                abs_floor = cell_res_fp.median() * 100.0   # only remove if residual is 5x median
-                threshold = torch.maximum(threshold, abs_floor) 
-                bad_fp = cell_res_fp > abs_floor
-
-
-                # --- Columns: bad in too many frames ---
-                bad_col_count = bad_fp.sum(dim=0)
-                col_thresh    = max(F_w - 2, 1)          # avoid 0 threshold with few frames
-                remove_cols   = bad_col_count >= col_thresh
-                keep_cols     = ~remove_cols
-
-                # --- Rows: bad in too many points ---
-                bad_row_count = bad_fp.sum(dim=1)
-                row_thresh    = max(P_w - 2, 1)          # avoid 0 threshold with few points
-                remove_frames = bad_row_count >= row_thresh
-                keep_frames   = ~remove_frames
-
-                # Per-entry masking only for entries NOT in removed rows/cols
-                # so that mask_w stays consistent with V/U sizes until slicing
-                bad_fp_entry = bad_fp.clone()
-                bad_fp_entry[~keep_frames] = False   # these rows will be removed entirely
-                bad_fp_entry[:, ~keep_cols] = False  # these cols will be removed entirely
-                mask_w = mask_w & ~bad_fp_entry.repeat_interleave(3, dim=0)
-            elif 0:
-                # per-cell residual magnitude
-                res = (W_filled - M).abs()
-                cell_res_fp = res.reshape(F_w, 3, P_w).max(dim=1).values  # (F_w, P_w)
-
-                # --- MAD threshold per column (robust to outlier inflation) ---
-                # For each point (column), compute median and MAD across frames
-                col_median = cell_res_fp.median(dim=0).values          # (P_w,)
-                col_mad    = (cell_res_fp - col_median).abs().median(dim=0).values  # (P_w,)
-                col_mad    = col_mad.clamp(min=1e-6)
-                # robust Z-score per entry
-                robust_z   = (cell_res_fp - col_median) / (1.4826 * col_mad)  # (F_w, P_w)
-                bad_fp     = robust_z > 3.0   # flag entries > 3 sigma
-
-                # --- Column removal: bad in more than X% of frames ---
-                bad_col_frac = bad_fp.float().mean(dim=0)   # (P_w,)
-                remove_cols  = bad_col_frac > 0.8           # remove if bad in >50% of frames
-                keep_cols    = ~remove_cols
-
-                # --- Frame removal: bad in more than X% of points ---
-                bad_row_frac = bad_fp.float().mean(dim=1)   # (F_w,)
-                remove_frames = bad_row_frac > 0.8
-                keep_frames   = ~remove_frames
-
-                # per-entry masking for entries not in removed rows/cols
-                bad_fp_entry = bad_fp.clone()
-                bad_fp_entry[~keep_frames] = False
-                bad_fp_entry[:, ~keep_cols] = False
-                mask_w = mask_w & ~bad_fp_entry.repeat_interleave(3, dim=0)
-
-            else:
+            if 1 :
 
                 inlier_cols, cell_res_fp = ransac_subspace(
                     W_filled, mask_w, rank=rank, 
@@ -450,6 +394,9 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-4, ri
             d, o = _update_affine_ortho(
                 tracks_w[0::3], tracks_w[1::3], lam_w, M, mask=mask_w[0::3]
             )
+            print("init_M NaNs:", torch.isnan(M).sum().item())
+            print("tracks NaNs:", torch.isnan(tracks_w).sum().item())
+            print("lam NaNs:", torch.isnan(lam_w).sum().item())
             if offset_mode == "normalize":
                 o = o - o[0]
             elif offset_mode == "zero":
@@ -472,7 +419,7 @@ def calibrate_with_completion(tracks, lam, mask, rank=4, iters=100, tol=1e-4, ri
         rho      = (W_scaled - M)[mask_w].norm().item()
 
         if it > 40 and abs(prev_rho - rho) < tol and (len(offset_history) < 2 or torch.allclose(offset_history[-1], offset_history[-2], atol=tol)):
-            #print(f"Converged at iteration {it} with step {abs(prev_rho - rho):.6f} and stable offset")
+            print(f"Converged at iteration {it} with step {abs(prev_rho - rho):.6f} and stable offset")
             break
         prev_rho = rho
 
