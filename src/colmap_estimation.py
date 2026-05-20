@@ -11,6 +11,8 @@ import numpy as np
 import pycolmap
 from pathlib import Path
 import tempfile
+from typing import Literal
+
 
 def _get_rigid3d(obj):
     """Return a Rigid3d from either a property or a callable (API changed across versions)."""
@@ -29,6 +31,25 @@ def _make_camera(K: np.ndarray, width: int = 1, height: int = 1) -> pycolmap.Cam
     )
 
 
+def _tensor_to_jpeg(tensor: torch.Tensor, path: Path) -> None:
+    """
+    Write a CHW or HWC float[0,1] / uint8[0,255] tensor as a JPEG.
+    Accepts: [C,H,W], [H,W,C], [H,W].  Requires Pillow.
+    """
+    from PIL import Image
+
+    t = tensor.detach().cpu()
+    if t.dtype != torch.uint8:
+        t = (t.clamp(0.0, 1.0) * 255).to(torch.uint8)
+    if t.ndim == 3 and t.shape[0] in (1, 3):   # CHW → HWC
+        t = t.permute(1, 2, 0)
+    if t.ndim == 3 and t.shape[2] == 1:         # [H,W,1] → [H,W]
+        t = t.squeeze(2)
+    Image.fromarray(t.numpy()).save(str(path), format="JPEG", quality=95)
+
+
+# ── Pairwise pose (unchanged) ─────────────────────────────────────────────────
+
 def estimate_pairwise_pose_colmap(
     obs_mat: torch.Tensor,
     Ks: torch.Tensor,
@@ -41,10 +62,10 @@ def estimate_pairwise_pose_colmap(
     estimator (LORANSAC + 5-point algorithm).
 
     Args:
-        obs_mat:         [2F, N] tracked keypoints (u, v interleaved per frame)
-        Ks:              [F, 3, 3] or [1, 3, 3] camera intrinsics
-        frame_i:         index of the first frame  (will be treated as reference)
-        frame_j:         index of the second frame
+        obs_mat:          [2F, N] tracked keypoints (u, v interleaved per frame)
+        Ks:               [F, 3, 3] or [1, 3, 3] camera intrinsics
+        frame_i:          index of the first frame  (will be treated as reference)
+        frame_j:          index of the second frame
         ransac_max_error: RANSAC inlier threshold in pixels
 
     Returns:
@@ -52,11 +73,10 @@ def estimate_pairwise_pose_colmap(
             R  - [3,3] float64 tensor  (cam_j rotation  relative to cam_i)
             t  - [3]   float64 tensor  (cam_j translation relative to cam_i, unit-norm)
     """
-    pts_i = obs_mat[frame_i * 2: frame_i * 2 + 2, :].T.cpu().numpy().astype(np.float64)  # [N, 2]
-    pts_j = obs_mat[frame_j * 2: frame_j * 2 + 2, :].T.cpu().numpy().astype(np.float64)  # [N, 2]
+    pts_i = obs_mat[frame_i * 2: frame_i * 2 + 2, :].T.cpu().numpy().astype(np.float64)
+    pts_j = obs_mat[frame_j * 2: frame_j * 2 + 2, :].T.cpu().numpy().astype(np.float64)
 
     N = pts_i.shape[0]
-    # identity matches: column k in obs_mat is the same track for both frames
     matches = np.stack([np.arange(N), np.arange(N)], axis=1).astype(np.uint32)
 
     K_i = Ks[min(frame_i, Ks.shape[0] - 1)].cpu().numpy().astype(np.float64)
@@ -80,7 +100,6 @@ def estimate_pairwise_pose_colmap(
     num_inliers = len(tvg.inlier_matches)
     inlier_ratio = num_inliers / N if N > 0 else 0.0
 
-    # cam2_from_cam1: Rigid3d  →  R, t  s.t.  x_j = R @ x_i + t
     pose = _get_rigid3d(tvg.cam2_from_cam1)
     R = torch.tensor(pose.rotation.matrix(), dtype=torch.float64)
     t = torch.tensor(pose.translation, dtype=torch.float64)
@@ -94,9 +113,191 @@ def estimate_pairwise_pose_colmap(
     }
 
 
+# ── Full COLMAP SIFT pipeline ─────────────────────────────────────────────────
+
+def run_colmap_sift_pipeline(
+    frames: torch.Tensor,
+    Ks: torch.Tensor | None,
+    frame_indices: list[int] | None = None,
+    *,
+    matching_strategy: Literal["exhaustive", "sequential"] = "exhaustive",
+    sequential_overlap: int = 10,
+    sift_num_features: int = 8192,
+    ransac_max_error: float = 4.0,
+    camera_mode: Literal["single", "per_frame"] = "single",
+    refine_focal_length: bool = False,
+    refine_principal_point: bool = False,
+) -> dict:
+    """
+    Full COLMAP pipeline from raw image tensors to registered camera poses,
+    using COLMAP's own SIFT for feature extraction and matching.
+
+    Tested against pycolmap 4.0.4.
+
+    Args:
+        frames:               [F, C, H, W] or [F, H, W, C], float[0,1] or uint8[0,255].
+        Ks:                   [F,3,3] or [1,3,3] calibrated intrinsics, or None to let
+                              COLMAP estimate (uses SIMPLE_RADIAL model).
+        frame_indices:        Integer labels used for image filenames. Defaults to 0…F-1.
+        matching_strategy:    "exhaustive"  – all pairs; fine for ≤ ~100 frames.
+                              "sequential"  – sliding window; use for video.
+        sequential_overlap:   Window half-size for sequential matching.
+        sift_num_features:    Max SIFT keypoints per image.
+        ransac_max_error:     Pixel threshold for geometric verification.
+        camera_mode:          "single"    – one shared camera (typical for monocular video).
+                              "per_frame" – one camera per image.
+        refine_focal_length:  Let BA adjust focal length (ignored when Ks is None).
+        refine_principal_point: Let BA adjust principal point.
+
+    Returns:
+        dict:
+            cam_lists        – list of F [3,4] float64 tensors  (NaN = not registered)
+                               Each is [R | t] s.t.  x_cam = R @ X_world + t
+            num_registered   – number of frames successfully registered
+            reconstruction   – pycolmap.Reconstruction  (use with reconstruction_reprojection_error)
+    """
+    F = frames.shape[0]
+    if frame_indices is None:
+        frame_indices = list(range(F))
+    assert len(frame_indices) == F, "len(frame_indices) must equal frames.shape[0]"
+
+    # Resolve H, W regardless of CHW vs HWC layout
+    if frames.ndim != 4:
+        raise ValueError(f"frames must be 4-D [F,C,H,W] or [F,H,W,C], got {tuple(frames.shape)}")
+    if frames.shape[1] in (1, 3):       # CHW
+        img_h, img_w = int(frames.shape[2]), int(frames.shape[3])
+    else:                                # HWC
+        img_h, img_w = int(frames.shape[1]), int(frames.shape[2])
+
+    colmap_camera_mode = (
+        pycolmap.CameraMode.SINGLE if camera_mode == "single"
+        else pycolmap.CameraMode.PER_IMAGE
+    )
+
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        tmpdir    = Path(_tmpdir)
+        image_dir = tmpdir / "images"
+        image_dir.mkdir()
+        db_path   = tmpdir / "colmap.db"
+        sparse_dir = tmpdir / "sparse"
+        sparse_dir.mkdir()
+
+        # ── 1. Write images to disk ────────────────────────────────────────────
+        names = []
+        for i, fi in enumerate(frame_indices):
+            name = f"frame_{fi:04d}.jpg"
+            names.append(name)
+            _tensor_to_jpeg(frames[i], image_dir / name)
+
+        # ── 2. Build ImageReaderOptions ────────────────────────────────────────
+        reader_options = pycolmap.ImageReaderOptions()
+        if Ks is not None:
+            K0 = Ks[0].cpu().numpy().astype(np.float64)
+            reader_options.camera_model  = "PINHOLE"
+            reader_options.camera_params = f"{K0[0,0]},{K0[1,1]},{K0[0,2]},{K0[1,2]}"
+        else:
+            reader_options.camera_model  = "SIMPLE_RADIAL"
+            reader_options.camera_params = ""
+
+        # ── 3. Feature extraction ──────────────────────────────────────────────
+        #   FeatureExtractionOptions wraps SiftExtractionOptions at .sift
+        extraction_options = pycolmap.FeatureExtractionOptions()
+        extraction_options.sift.max_num_features = sift_num_features
+        extraction_options.use_gpu = torch.cuda.is_available()
+
+        pycolmap.extract_features(
+            database_path=str(db_path),
+            image_path=str(image_dir),
+            camera_mode=colmap_camera_mode,
+            reader_options=reader_options,
+            extraction_options=extraction_options,
+        )
+
+        # Patch per-frame Ks into DB after extraction (per_frame mode only)
+        if Ks is not None and camera_mode == "per_frame":
+            _overwrite_camera_params_db(db_path, names, Ks, frame_indices, img_w, img_h)
+
+        # ── 4. Feature matching ────────────────────────────────────────────────
+        #   FeatureMatchingOptions wraps SiftMatchingOptions at .sift
+        matching_options = pycolmap.FeatureMatchingOptions()
+        matching_options.use_gpu = torch.cuda.is_available()
+
+        verification_options = pycolmap.TwoViewGeometryOptions()
+        verification_options.ransac = pycolmap.RANSACOptions(max_error=ransac_max_error)
+        verification_options.compute_relative_pose = True
+
+        if matching_strategy == "exhaustive":
+            pycolmap.match_exhaustive(
+                database_path=str(db_path),
+                matching_options=matching_options,
+                verification_options=verification_options,
+            )
+
+        elif matching_strategy == "sequential":
+            pairing_options = pycolmap.SequentialPairingOptions()
+            pairing_options.overlap = sequential_overlap
+            pycolmap.match_sequential(
+                database_path=str(db_path),
+                matching_options=matching_options,
+                pairing_options=pairing_options,
+                verification_options=verification_options,
+            )
+
+        else:
+            raise ValueError(f"Unknown matching_strategy: {matching_strategy!r}")
+
+        # ── 5. Incremental mapping ─────────────────────────────────────────────
+        #   IncrementalPipelineOptions is the top-level options object in 4.0.4;
+        #   it contains a .mapper (IncrementalMapperOptions) and .ba fields.
+        pipeline_options = pycolmap.IncrementalPipelineOptions()
+
+        # Intrinsic refinement control lives on the mapper sub-object
+        mapper_opts = pipeline_options.mapper
+        mapper_opts.abs_pose_refine_focal_length = refine_focal_length
+        mapper_opts.abs_pose_refine_extra_params  = refine_principal_point
+
+        maps = pycolmap.incremental_mapping(
+            database_path=str(db_path),
+            image_path=str(image_dir),
+            output_path=str(sparse_dir),
+            options=pipeline_options,
+        )
+
+        if not maps:
+            return {
+                "cam_lists":      [torch.full((3, 4), float("nan"), dtype=torch.float64)] * F,
+                "num_registered": 0,
+                "reconstruction": None,
+            }
+
+        # Largest connected component
+        rec = maps[max(maps, key=lambda k: maps[k].num_reg_images())]
+
+        # ── 6. Extract [R|t] pose tensors ──────────────────────────────────────
+        name_to_pose: dict[str, torch.Tensor] = {}
+        for img in rec.images.values():
+            pose = _get_rigid3d(img.cam_from_world)
+            R = torch.tensor(pose.rotation.matrix(), dtype=torch.float64)
+            t = torch.tensor(pose.translation,       dtype=torch.float64)
+            name_to_pose[img.name] = torch.cat([R, t.unsqueeze(1)], dim=1)
+
+        cam_lists = [
+            name_to_pose.get(n, torch.full((3, 4), float("nan"), dtype=torch.float64))
+            for n in names
+        ]
+
+        return {
+            "cam_lists":      cam_lists,
+            "num_registered": rec.num_reg_images(),
+            "reconstruction": rec,
+        }
+        # TemporaryDirectory cleaned up here — images and DB are deleted
+
+
+# ── Injected-track multiview (kept for compatibility) ─────────────────────────
+
 def _write_dummy_jpeg(path: Path) -> None:
-    """Write the smallest valid 1x1 JPEG so COLMAP can open the file."""
-    # Minimal 1×1 white JPEG (no external deps required)
+    """Write the smallest valid 1×1 JPEG so COLMAP can open the file."""
     _JPEG_1x1 = bytes([
         0xFF,0xD8,0xFF,0xE0,0x00,0x10,0x4A,0x46,0x49,0x46,0x00,0x01,0x01,0x00,0x00,0x01,
         0x00,0x01,0x00,0x00,0xFF,0xDB,0x00,0x43,0x00,0x08,0x06,0x06,0x07,0x06,0x05,0x08,
@@ -130,19 +331,21 @@ def estimate_multiview_pose_colmap_incremental(
     ransac_max_error: float = 2.0,
 ) -> dict:
     """
-    Run pycolmap incremental SfM on N frames using tracks from obs_mat.
+    Run pycolmap incremental SfM on N frames using pre-computed tracks from obs_mat.
+    Uses injected keypoints/matches rather than COLMAP's own SIFT.
 
-    Builds the COLMAP database entirely via sqlite3 (no pycolmap.Database),
-    then calls pycolmap.verify_matches and pycolmap.incremental_mapping.
+    Args:
+        obs_mat:       [2F, N] tracked keypoints (u, v interleaved per frame)
+        Ks:            [F,3,3] or [1,3,3] camera intrinsics
+        frame_indices: which global frame indices the rows of obs_mat refer to
+        ransac_max_error: RANSAC inlier threshold in pixels
     """
-    import pycolmap
     import sqlite3
     from itertools import combinations
 
     F = len(frame_indices)
     N = obs_mat.shape[1]
 
-    # COLMAP pair_id encoding (matches C++ ImagePairToPairId)
     _MAX_IMAGE_ID = 2147483647
     def _pair_id(a, b):
         lo, hi = min(a, b), max(a, b)
@@ -152,7 +355,6 @@ def estimate_multiview_pose_colmap_incremental(
         tmpdir = Path(tmpdir)
         db_path = tmpdir / "colmap.db"
 
-        # ── 1. Create database schema via sqlite3 ──────────────────────────────
         conn = sqlite3.connect(str(db_path))
         conn.executescript("""
             CREATE TABLE cameras (
@@ -198,7 +400,6 @@ def estimate_multiview_pose_colmap_incremental(
             );
         """)
 
-        # ── 2. Insert cameras (PINHOLE = model 1) ─────────────────────────────
         camera_ids = []
         for i in range(F):
             K = Ks[min(frame_indices[i], Ks.shape[0] - 1)].cpu().numpy().astype(np.float64)
@@ -210,7 +411,6 @@ def estimate_multiview_pose_colmap_incremental(
             )
             camera_ids.append(cur.lastrowid)
 
-        # ── 3. Insert images ───────────────────────────────────────────────────
         image_ids = []
         for i in range(F):
             name = f"frame_{frame_indices[i]:04d}.jpg"
@@ -221,14 +421,19 @@ def estimate_multiview_pose_colmap_incremental(
             image_ids.append(cur.lastrowid)
             _write_dummy_jpeg(tmpdir / name)
 
-        # ── 4. Insert keypoints and matches ────────────────────────────────────
         identity_matches = np.stack([np.arange(N), np.arange(N)], axis=1).astype(np.uint32)
 
         for i in range(F):
-            kpts = obs_mat[i*2: i*2+2, :].T.cpu().numpy().astype(np.float32)  # [N, 2]
+            # Fix: use frame_indices[i] not i when indexing obs_mat
+            kpts = obs_mat[frame_indices[i]*2: frame_indices[i]*2+2, :].T \
+                          .cpu().numpy().astype(np.float32)
             conn.execute(
                 "INSERT INTO keypoints(image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
                 (image_ids[i], N, 2, kpts.tobytes()),
+            )
+            conn.execute(
+                "INSERT INTO descriptors(image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                (image_ids[i], 0, 128, b""),
             )
 
         pairs_lines = []
@@ -244,7 +449,6 @@ def estimate_multiview_pose_colmap_incremental(
         conn.commit()
         conn.close()
 
-        # ── 3. Geometric verification ──────────────────────────────────────────
         pairs_path = tmpdir / "pairs.txt"
         pairs_path.write_text("\n".join(pairs_lines))
 
@@ -257,23 +461,20 @@ def estimate_multiview_pose_colmap_incremental(
             ),
         )
 
-        # ── 4. Incremental reconstruction ─────────────────────────────────────
         output_path = tmpdir / "sparse"
         output_path.mkdir()
 
         maps = pycolmap.incremental_mapping(
             database_path=str(db_path),
-            image_path=str(tmpdir),  # dummy, no actual images read
+            image_path=str(tmpdir),
             output_path=str(output_path),
         )
 
         if not maps:
-            return {"cam_lists": [torch.full((3,4), float('nan'), dtype=torch.float64)] * F}
+            return {"cam_lists": [torch.full((3, 4), float("nan"), dtype=torch.float64)] * F}
 
-        # largest reconstruction
         rec = maps[max(maps, key=lambda k: maps[k].num_reg_images())]
 
-        # ── 5. Extract poses in frame_indices order ────────────────────────────
         name_to_pose = {}
         for img in rec.images.values():
             pose = _get_rigid3d(img.cam_from_world)
@@ -285,22 +486,54 @@ def estimate_multiview_pose_colmap_incremental(
         for i in range(F):
             name = f"frame_{frame_indices[i]:04d}.jpg"
             cam_lists.append(name_to_pose.get(
-                name, torch.full((3, 4), float('nan'), dtype=torch.float64)
+                name, torch.full((3, 4), float("nan"), dtype=torch.float64)
             ))
 
         return {
-            "cam_lists": cam_lists,
+            "cam_lists":      cam_lists,
             "num_registered": rec.num_reg_images(),
             "reconstruction": rec,
         }
 
 
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _overwrite_camera_params_db(
+    db_path: Path,
+    names: list[str],
+    Ks: torch.Tensor,
+    frame_indices: list[int],
+    img_w: int,
+    img_h: int,
+) -> None:
+    """
+    After extract_features, patch the DB cameras with the supplied per-frame Ks.
+    Only needed when camera_mode='per_frame' and Ks is not None.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    name_to_fi = {n: fi for n, fi in zip(names, frame_indices)}
+
+    rows = conn.execute("SELECT image_id, name, camera_id FROM images").fetchall()
+    for _image_id, name, camera_id in rows:
+        fi = name_to_fi.get(name)
+        if fi is None:
+            continue
+        K = Ks[min(fi, Ks.shape[0] - 1)].cpu().numpy().astype(np.float64)
+        params = np.array([K[0,0], K[1,1], K[0,2], K[1,2]], dtype=np.float64)
+        conn.execute(
+            "UPDATE cameras SET model=1, width=?, height=?, params=? WHERE camera_id=?",
+            (img_w, img_h, params.tobytes(), camera_id),
+        )
+
+    conn.commit()
+    conn.close()
+
+
 def reconstruction_reprojection_error(rec) -> dict:
     """
     Compute reprojection error from a pycolmap Reconstruction object.
-
-    Args:
-        rec: pycolmap.Reconstruction returned by incremental_mapping.
 
     Returns dict with:
         mean_error   - mean reprojection error over all observations (pixels)
@@ -324,10 +557,9 @@ def reconstruction_reprojection_error(rec) -> dict:
         for p2d in img.points2D:
             if p2d.point3D_id not in rec.points3D:
                 continue
-            X = torch.tensor(rec.points3D[p2d.point3D_id].xyz, dtype=torch.float64)
+            X   = torch.tensor(rec.points3D[p2d.point3D_id].xyz, dtype=torch.float64)
             obs = torch.tensor(p2d.xy, dtype=torch.float64)
-
-            X_cam = R @ X + t
+            X_cam  = R @ X + t
             x_proj = (K @ X_cam)[:2] / (K @ X_cam)[2]
             img_errors.append((x_proj - obs).norm().item())
 

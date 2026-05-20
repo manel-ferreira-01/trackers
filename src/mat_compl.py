@@ -167,7 +167,7 @@ def ransac_subspace(W_filled, mask_w, rank=4, n_iters=100,
     if threshold is None:
         # set threshold as median absolute column norm * factor
         col_norms = W_filled.norm(dim=0)  # (P,)
-        threshold = col_norms.median() * 0.005
+        threshold = col_norms.median() * 0.01
 
     best_inliers = torch.zeros(P, dtype=torch.bool, device=device)
     best_count = 0

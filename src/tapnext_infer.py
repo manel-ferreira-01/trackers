@@ -180,7 +180,7 @@ def run_tapnext_growing(video_tensor, query_points_initial, tapnext, device="cud
     #   'state': current TAPNextTrackingState
     #   'ids': list of track_ids in this generation (in order)
     generations = []
-    detector_fn = make_grid_detector_fn(cell_size=8, min_dist=3, device=device)
+    detector_fn = make_grid_detector_fn(cell_size=20, min_dist=4, device=device)
     with torch.no_grad():
         with torch.amp.autocast(device, dtype=torch.float32, enabled=True):
 
@@ -221,8 +221,8 @@ def run_tapnext_growing(video_tensor, query_points_initial, tapnext, device="cud
                 if k % 5 == 0:
                     existing_pos = torch.stack(all_visible_positions).to(device) \
                         if all_visible_positions else torch.zeros((0, 2), device=device)
-                    #new_queries = detector_fn(frame[0, 0], existing_pos, frame_idx=k)
-                    new_queries = None  # disable new tracks for now
+                    new_queries = detector_fn(frame[0, 0], existing_pos, frame_idx=k)
+                    #new_queries = None  # disable new tracks for now
 
                     if new_queries is not None and new_queries.shape[0] > 0:
                         N_new = new_queries.shape[0]
